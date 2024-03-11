@@ -121,7 +121,7 @@ def read_nemo_manifest(config, is_tarred: bool) -> CutSet:
                     shuffle_shards=config.shuffle,
                     **common_kwargs,
                 )
-            )
+            ).repeat()
         else:
             cuts = CutSet(LazyNeMoIterator(config.manifest_filepath, **notar_kwargs, **common_kwargs))
     else:
