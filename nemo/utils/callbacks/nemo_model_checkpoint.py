@@ -23,6 +23,7 @@ import pytorch_lightning
 import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint, _is_local_file_protocol
 
 from nemo.collections.common.callbacks import EMA
 from nemo.utils import logging
