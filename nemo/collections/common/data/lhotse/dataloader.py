@@ -26,6 +26,7 @@ from lhotse.dataset import (
     CutConcatenate,
     DynamicBucketingSampler,
     DynamicCutSampler,
+    ExtraPadding,
     IterableDatasetWrapper,
     ReverbWithImpulseResponse,
     make_worker_init_fn,
@@ -124,6 +125,11 @@ class LhotseDataLoadingConfig:
     rir_enabled: bool = False
     rir_path: str | None = None  # str, must point to a lhotse RecordingSet manifest
     rir_prob: float = 0.5
+    #   f. On-the-fly audio padding with silence.
+    extra_padding_seconds: Optional[float] = None
+    extra_padding_preserve_id: bool = True  # if True, preserves the original cuts IDs. Otherwise, new random IDs are generated for the augmented cuts.
+    extra_padding_randomized: bool = False  # if True, will sample a value from [0, extra_padding_seconds] for each cut.
+    extra_padding_direction: str = "both"   # "both" or "left" or "right".
 
     # 5. Other Lhotse options.
     text_field: str = "text"  # key to read the transcript from
@@ -319,6 +325,16 @@ def get_lhotse_dataloader_from_config(
             ReverbWithImpulseResponse(
                 rir_recordings=RecordingSet.from_file(config.rir_path) if config.rir_path is not None else None,
                 p=config.rir_prob,
+            )
+        )
+
+    if config.extra_padding_seconds:
+        sampler = sampler.map(
+            ExtraPadding(
+                extra_seconds=config.extra_padding_seconds,
+                preserve_id=config.extra_padding_preserve_id,
+                randomized=config.extra_padding_randomized,
+                direction=config.extra_padding_direction,
             )
         )
 

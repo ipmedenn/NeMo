@@ -878,6 +878,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
             'channel_selector': config.get('channel_selector', None),
         }
 
+        # get additional lhotse dataloader options from augmentor
+        if config.get("augmentor"):
+            dl_config.update(config.get("augmentor"))
+
         temporary_datalayer = self._setup_dataloader_from_config(config=DictConfig(dl_config), inference=True)
         return temporary_datalayer
 
