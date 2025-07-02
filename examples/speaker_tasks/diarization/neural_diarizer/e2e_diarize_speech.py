@@ -76,23 +76,25 @@ class DiarizationConfig:
 
     model_path: Optional[str] = None  # Path to a .nemo file
     dataset_manifest: Optional[str] = None  # Path to dataset's JSON manifest
-    presort_manifest: Optional[bool] = True
+    presort_manifest: Optional[bool] = True # If True, the manifest will be sorted by audio length
 
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
     no_der: bool = False
-    out_rttm_dir: Optional[str] = None
-    save_preds_tensors: bool = False
+    out_rttm_dir: Optional[str] = None # Directory to save the RTTM files
+    save_preds_tensors: bool = False # If True, the prediction tensors will be saved
+    visualization: bool = False # If True, the visualizations will be saved to out_viz_dir
+    out_viz_dir: Optional[str] = None # Directory to save the visualization files (PNG and GIF for streaming mode)
+    visualization_speedup_factor: float = 1.0  # Factor to speed up streaming visualization (2.5 means 2.5x faster)
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
-    batch_size: int = 1
+    use_lhotse: bool = True
+    batch_size: int = 1 # Number of sessions in the batch
+    batch_duration: int = 100000 # Maximum total duration of the batch in seconds (only for lhotse)
     num_workers: int = 0
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
     log: bool = False  # If True, log will be printed
-
-    use_lhotse: bool = True
-    batch_duration: int = 33000
 
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25  # Collar in seconds for DER calculation
@@ -387,6 +389,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     diar_model.sortformer_modules.fifo_len = cfg.fifo_len
     diar_model.sortformer_modules.log = cfg.log
     diar_model.sortformer_modules.spkcache_refresh_rate = cfg.spkcache_refresh_rate
+    diar_model.sortformer_modules.visualization = cfg.visualization
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
@@ -394,7 +397,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
 
-    if os.path.exists(tensor_path) and cfg.save_preds_tensors:
+    if os.path.exists(tensor_path) and cfg.save_preds_tensors and not cfg.visualization:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
         )
@@ -440,6 +443,47 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             ignore_overlap=cfg.ignore_overlap,
         )
         logging.info(f"PostProcessingParams: {postprocessing_cfg}")
+
+    if cfg.visualization:
+        # Get durations from the manifest for accurate visualization
+        durations_list = [v['duration'] for v in infer_audio_rttm_dict.values()]
+
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        plt.style.use('fast')
+        
+        if cfg.out_viz_dir is None:
+            out_dir = tempfile.mkdtemp()
+            logging.warning(f"out_viz_dir is not specified, using temporary directory: {out_dir}")
+        else:
+            out_dir = cfg.out_viz_dir
+        if not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        logging.info(f"Saving visualization to {out_dir}")
+        
+        # Create PNG visualizations (final diarization result)
+        logging.info("Creating diarization heatmaps (PNG images)")
+        diar_model.sortformer_modules.save_diarization_heatmaps(
+            preds_list=diar_model_preds_total_list,
+            durations_list=durations_list,
+            uniq_ids=list(infer_audio_rttm_dict.keys()),
+            out_dir=out_dir,
+        )
+        
+        # Create streaming GIF visualizations if in streaming mode
+        if hasattr(diar_model, 'streaming_mode') and diar_model.streaming_mode:
+            logging.info("Creating streaming visualizations (GIF animations)")
+            diar_model.sortformer_modules.save_streaming_visualizations(
+                spkcache_preds_list=diar_model.sortformer_modules.spkcache_preds_list,
+                fifo_preds_list=diar_model.sortformer_modules.fifo_preds_list,
+                chunk_preds_list=diar_model.sortformer_modules.chunk_preds_list,
+                durations_list=durations_list,
+                uniq_ids=list(infer_audio_rttm_dict.keys()),
+                out_dir=out_dir,
+                speedup_factor=cfg.visualization_speedup_factor,
+            )
 
     # clean-up
     if cfg.presort_manifest is not None:

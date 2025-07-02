@@ -20,6 +20,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import matplotlib.pyplot as plt
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+
 from nemo.core.classes.exportable import Exportable
 from nemo.core.classes.module import NeuralModule
 from nemo.utils import logging
@@ -123,6 +128,16 @@ class SortformerModules(NeuralModule, Exportable):
         self.strong_boost_rate = strong_boost_rate
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
+        self.visualization = False
+        self.spkcache_preds_list = []
+        self.fifo_preds_list = []
+        self.chunk_preds_list = []
+
+    def init_visualization_lists(self):
+        """Initializes the lists for visualization."""
+        self.spkcache_preds_list = []
+        self.fifo_preds_list = []
+        self.chunk_preds_list = []
 
     def length_to_mask(self, lengths, max_length: int):
         """
@@ -398,6 +413,9 @@ class SortformerModules(NeuralModule, Exportable):
                 f"chunk_preds: {chunk_preds.shape}"
             )
 
+        if self.visualization:
+            raise NotImplementedError("Visualization is not implemented for asynchronous streaming")
+            
         return streaming_state, chunk_preds
 
     def streaming_update(self, streaming_state, chunk, preds, lc: int = 0, rc: int = 0):
@@ -439,6 +457,12 @@ class SortformerModules(NeuralModule, Exportable):
         streaming_state.fifo_preds = preds[:, spkcache_len : spkcache_len + fifo_len]
         chunk = chunk[:, lc : chunk_len + lc]
         chunk_preds = preds[:, spkcache_len + fifo_len + lc : spkcache_len + fifo_len + chunk_len + lc]
+        
+        if not self.training and self.visualization:
+            spkcache_preds = preds[:, :spkcache_len]
+            self.spkcache_preds_list[-1].append(spkcache_preds.detach().cpu().numpy())
+            self.fifo_preds_list[-1].append(streaming_state.fifo_preds.detach().cpu().numpy())
+            self.chunk_preds_list[-1].append(chunk_preds.detach().cpu().numpy())
 
         # pop_out_len is the number of frames we will pop out from FIFO to update spkcache
         if self.fifo_len == 0:
@@ -755,3 +779,333 @@ class SortformerModules(NeuralModule, Exportable):
         topk_indices, is_disabled = self._get_topk_indices(scores)
         spkcache, spkcache_preds = self._gather_spkcache_and_preds(emb_seq, preds, topk_indices, is_disabled)
         return spkcache, spkcache_preds, spk_perm
+
+    def save_streaming_visualizations(
+        self,
+        spkcache_preds_list,
+        fifo_preds_list,
+        chunk_preds_list,
+        durations_list=None,
+        uniq_ids=None,
+        out_dir='./',
+        speedup_factor=1.0,
+    ):
+        """
+        Visualize the spkcache, FIFO queue, and chunk predictions for all sessions.
+        Each session is saved as a gif file.
+        Args:
+            spkcache_preds_list: list of lists of torch.Tensor, [batch_idx][step_idx] -> (B, spkcache_len, num_spks)
+            fifo_preds_list: list of lists of torch.Tensor, [batch_idx][step_idx] -> (B, fifo_len, num_spks)
+            chunk_preds_list: list of lists of torch.Tensor, [batch_idx][step_idx] -> (B, chunk_len, num_spks)
+            durations_list: list of floats, containing the duration in seconds for each session
+            uniq_ids: list of unique identifiers for each session
+            out_dir: directory to save the gif files
+            speedup_factor: factor to speed up the visualization (e.g., 2.5 means 2.5x faster)
+        """
+        if not spkcache_preds_list:
+            logging.warning("spkcache_preds_list is empty. Cannot generate visualization.")
+            return
+
+        # Unpack the per-batch data into per-sample data
+        spk_samples, fifo_samples, chunk_samples = [], [], []
+        for batch_idx in range(len(spkcache_preds_list)):
+            if not spkcache_preds_list[batch_idx]:
+                continue
+
+            num_steps = len(spkcache_preds_list[batch_idx])
+            batch_size_for_this_batch = spkcache_preds_list[batch_idx][0].shape[0]
+
+            spk_in_batch = [[] for _ in range(batch_size_for_this_batch)]
+            fifo_in_batch = [[] for _ in range(batch_size_for_this_batch)]
+            chunk_in_batch = [[] for _ in range(batch_size_for_this_batch)]
+
+            for step_idx in range(num_steps):
+                spk_step = spkcache_preds_list[batch_idx][step_idx]
+                fifo_step = fifo_preds_list[batch_idx][step_idx]
+                chunk_step = chunk_preds_list[batch_idx][step_idx]
+                for i in range(batch_size_for_this_batch):
+                    spk_in_batch[i].append(spk_step[i])
+                    fifo_in_batch[i].append(fifo_step[i])
+                    chunk_in_batch[i].append(chunk_step[i])
+
+            spk_samples.extend(spk_in_batch)
+            fifo_samples.extend(fifo_in_batch)
+            chunk_samples.extend(chunk_in_batch)
+
+        num_samples = len(spk_samples)
+        if uniq_ids is None:
+            uniq_ids = [f'session_{i:05d}' for i in range(num_samples)]
+
+        # Create a single reusable figure and axes for all GIFs to improve performance
+        has_fifo = self.fifo_len > 0
+        min_chunk_width = max(1, self.chunk_len, int((self.fifo_len + self.spkcache_len) * 0.05))
+
+        if has_fifo:
+            num_plots = 3
+            width_ratios = [max(1, self.spkcache_len), max(1, self.fifo_len), min_chunk_width]
+            figsize = (40, 3)
+        else:
+            num_plots = 2
+            width_ratios = [max(1, self.spkcache_len), min_chunk_width]
+            figsize = (30, 3)
+
+        fig, axs = plt.subplots(
+            1, num_plots, figsize=figsize, layout='constrained', width_ratios=width_ratios, height_ratios=[1]
+        )
+
+        FS = 20
+        cmap_str = 'viridis'
+        aspect_float = 7.0
+        spkcache_placeholder = np.zeros((self.spkcache_len, self.n_spk))
+        chunk_placeholder = np.zeros((self.chunk_len, self.n_spk))
+
+        im_spkcache = axs[0].imshow(
+            spkcache_placeholder.T, cmap=cmap_str, interpolation='nearest', aspect=aspect_float, vmin=0, vmax=1
+        )
+        axs[0].set_title('Speaker Cache', fontsize=FS)
+
+        artists = {'im_spkcache': im_spkcache}
+        if has_fifo:
+            fifo_placeholder = np.zeros((self.fifo_len, self.n_spk))
+            im_fifo = axs[1].imshow(
+                fifo_placeholder.T, cmap=cmap_str, interpolation='nearest', aspect=aspect_float, vmin=0, vmax=1
+            )
+            axs[1].set_title('FIFO queue', fontsize=FS)
+            im_chunk = axs[2].imshow(
+                chunk_placeholder.T, cmap=cmap_str, interpolation='nearest', aspect=aspect_float, vmin=0, vmax=1
+            )
+            title_chunk = axs[2].set_title('Chunk 00:00.00', fontsize=FS)
+            artists.update({'im_fifo': im_fifo, 'im_chunk': im_chunk, 'title_chunk': title_chunk})
+        else:
+            im_chunk = axs[1].imshow(
+                chunk_placeholder.T, cmap=cmap_str, interpolation='nearest', aspect=aspect_float, vmin=0, vmax=1
+            )
+            title_chunk = axs[1].set_title('Chunk 00:00.00', fontsize=FS)
+            artists.update({'im_chunk': im_chunk, 'title_chunk': title_chunk})
+
+        for ax in axs:
+            ax.get_xaxis().set_visible(False)
+            ax.get_yaxis().set_visible(True)
+            ax.set_yticks(np.arange(self.n_spk))
+            ax.set_yticklabels([f'spk_{i}' for i in range(self.n_spk)], fontsize=FS / 1.5)
+            ax.tick_params(axis='y', length=0, pad=2)
+
+        pbar = tqdm(range(num_samples), desc="Visualizing sessions")
+        for sample_idx in pbar:
+            if sample_idx >= len(uniq_ids):
+                logging.warning(f"Skipping visualization for sample_idx {sample_idx} due to missing uniq_id.")
+                continue
+
+            uniq_id = uniq_ids[sample_idx]
+            pbar.set_description(f'Visualizing session {uniq_id}')
+
+            spkcache_preds = spk_samples[sample_idx]
+            fifo_preds = fifo_samples[sample_idx]
+            chunk_preds = chunk_samples[sample_idx]
+
+            # If durations are provided, calculate the valid number of steps and truncate the data
+            if durations_list and sample_idx < len(durations_list):
+                duration = durations_list[sample_idx]
+                # Each frame corresponds to subsampling_factor * 10ms
+                time_per_frame = self.subsampling_factor * 0.01
+                total_valid_frames = math.ceil(duration / time_per_frame)
+                total_valid_steps = math.ceil(total_valid_frames / self.chunk_len)
+
+                spkcache_preds = spkcache_preds[:total_valid_steps]
+                fifo_preds = fifo_preds[:total_valid_steps]
+                chunk_preds = chunk_preds[:total_valid_steps]
+
+            pbar.set_description(f'Generating frames for session {uniq_id}')
+            frames = self.preds_to_frames(fig, artists, spkcache_preds, fifo_preds, chunk_preds)
+
+            pbar.set_description(f'Saving GIF for session {uniq_id}')
+            frame_duration_ms = self.chunk_len * self.subsampling_factor * 10 / speedup_factor
+            self.array_to_gif(frames, f'{out_dir}/{uniq_id}.gif', frame_duration=frame_duration_ms)
+
+        plt.close(fig)
+
+    def preds_to_frames(self, fig, artists, spkcache_preds, fifo_preds, chunk_preds):
+        """
+        Generate frames from the spkcache, FIFO queue, and chunk predictions from one session.
+        Args:
+            fig: The matplotlib figure object.
+            artists: A dictionary of matplotlib artist objects to update.
+            spkcache_preds: list of np.ndarray, [(spkcache_len, num_spks)]
+            fifo_preds: list of np.ndarray, [(fifo_len, num_spks)]
+            chunk_preds: list of np.ndarray, [(chunk_len, num_spks)]
+        """
+        n_steps = len(spkcache_preds)
+        logging.info(f"Generating frames for {n_steps} steps")
+        if n_steps == 0:
+            return []
+
+        frames = []
+        for step_idx in range(n_steps):
+            frame = self._generate_frame(
+                fig=fig,
+                artists=artists,
+                spkcache_pred=spkcache_preds[step_idx],
+                fifo_pred=fifo_preds[step_idx],
+                chunk_pred=chunk_preds[step_idx],
+                step_idx=step_idx,
+            )
+            frames.append(frame)
+
+        return frames
+
+    def _generate_frame(self, fig, artists, spkcache_pred, fifo_pred, chunk_pred, step_idx):
+        """
+        Generate a single frame for the streaming visualization GIF.
+        """
+          # Update artists with new data for the current step
+        im_spkcache = artists['im_spkcache']
+        im_chunk = artists['im_chunk']
+        title_chunk = artists['title_chunk']
+
+        if spkcache_pred.shape[0] < self.spkcache_len:
+            spkcache_pred = np.pad(
+                spkcache_pred,
+                ((self.spkcache_len - spkcache_pred.shape[0], 0), (0, 0)),
+                'constant',
+                constant_values=0,
+            )
+        im_spkcache.set_data(spkcache_pred.T)
+
+        im_chunk.set_data(chunk_pred.T)
+
+        if 'im_fifo' in artists:
+            im_fifo = artists['im_fifo']
+            if fifo_pred.shape[0] < self.fifo_len:
+                fifo_pred = np.pad(
+                    fifo_pred, ((self.fifo_len - fifo_pred.shape[0], 0), (0, 0)), 'constant', constant_values=0
+                )
+            im_fifo.set_data(fifo_pred.T)
+
+        # Update title for the chunk plot
+        offset = round(step_idx * self.chunk_len * self.subsampling_factor * 0.01, 2)
+        minutes = int(offset // 60)
+        seconds = offset % 60
+        title_chunk.set_text(f'Chunk {minutes:02}:{seconds:05.2f}')
+
+        # Render the updated figure to a buffer and convert to an image
+        fig.canvas.draw()
+        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype='uint8')
+        frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+        return Image.fromarray(frame)
+
+    def array_to_gif(self, frames, filepath, frame_duration=960):
+        """
+        Save a list of frames as a gif file.
+        Args:
+            frames: list of PIL.Image, [frame1, frame2, ...]
+            filepath: str, the path to save the gif file
+            frame_duration: int, the duration in milliseconds per frame
+        """
+        if not frames:
+            logging.warning("No frames to save for GIF.")
+            return
+        frames[0].save(filepath, save_all=True, append_images=frames[1:], duration=frame_duration, loop=0)
+
+    def save_diarization_heatmaps(self, preds_list, durations_list=None, uniq_ids=None, out_dir='./'):
+        """
+        Create static heatmap visualizations of speaker diarization predictions.
+        Each session is saved as a PNG file showing speaker activity over time.
+        Args:
+            preds_list: list of torch.Tensor, containing predictions for each sample.
+                        Each tensor is expected to be of shape (1, num_frames, num_spks).
+            durations_list: list of floats, containing the duration in seconds for each sample.
+            uniq_ids: list of unique identifiers for each session.
+            out_dir: directory to save the PNG files.
+        """
+        if not preds_list:
+            logging.warning("preds_list is empty. Cannot generate diarization heatmaps.")
+            return
+
+        num_samples = len(preds_list)
+        if uniq_ids is None:
+            uniq_ids = [f'session_{i:05d}' for i in range(num_samples)]
+
+        # Reuse the same figure and axes for all plots to speed up the process
+        fig, ax = plt.subplots(1, 1, figsize=(20, 6))
+
+        pbar = tqdm(range(num_samples), desc="Generating diarization heatmaps")
+        for sample_idx in pbar:
+            if sample_idx >= len(uniq_ids):
+                logging.warning(f"Skipping visualization for sample_idx {sample_idx} due to missing uniq_id.")
+                continue
+
+            uniq_id = uniq_ids[sample_idx]
+            logging.info(f'Creating heatmap for session {uniq_id}')
+
+            # Get predictions for this sample
+            preds = preds_list[sample_idx].squeeze(0).detach().cpu().numpy()  # (num_frames, num_spks)
+
+            # Truncate padding if duration is provided
+            if durations_list and sample_idx < len(durations_list):
+                duration = durations_list[sample_idx]
+                # Each frame corresponds to subsampling_factor * 10ms
+                time_per_frame = self.subsampling_factor * 0.01
+                valid_len = math.ceil(duration / time_per_frame)
+                preds = preds[:valid_len, :]
+
+            # Create the visualization
+            self.create_diarization_heatmap(preds, uniq_id, out_dir, fig, ax)
+
+        # Close the figure after the loop
+        plt.close(fig)
+        logging.info(f"Saved all diarization heatmaps to {out_dir}")
+
+    def create_diarization_heatmap(self, preds, uniq_id, out_dir, fig, ax):
+        """
+        Create a static heatmap plot for diarization predictions.
+        Args:
+            preds: np.ndarray, (num_frames, num_spks) - speaker activity probabilities
+            uniq_id: str, unique identifier for the session
+            out_dir: str, directory to save the plot
+            fig: matplotlib.figure.Figure, the figure object
+            ax: matplotlib.axes.Axes, the axes object to plot on
+        """
+        num_frames, num_spks = preds.shape
+
+        # Clear previous plot artifacts
+        ax.clear()
+
+        # Create the heatmap
+        im = ax.imshow(
+            preds.T,
+            cmap='viridis',
+            interpolation='nearest',
+            aspect='auto',
+            vmin=0,
+            vmax=1,
+            origin='upper',
+        )
+
+        # Set labels and title
+        ax.set_xlabel('Time Frames', fontsize=14)
+        ax.set_ylabel('Speakers', fontsize=14)
+
+        # Set y-axis ticks and labels
+        ax.set_yticks(range(num_spks))
+        ax.set_yticklabels([f'Speaker {i}' for i in range(num_spks)])
+
+        # Add time axis labels (convert frames to seconds)
+        time_step_sec = self.subsampling_factor * 0.01  # 10ms per frame * subsampling_factor
+        num_time_ticks = min(10, num_frames // 50)  # Show at most 10 time labels
+        if num_time_ticks > 1:
+            time_tick_indices = np.linspace(0, num_frames - 1, num_time_ticks).astype(int)
+            time_tick_labels = [f'{idx * time_step_sec:.1f}s' for idx in time_tick_indices]
+            ax.set_xticks(time_tick_indices)
+            ax.set_xticklabels(time_tick_labels)
+
+        # Add colorbar
+        cbar = fig.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label('Speaker Activity Probability', fontsize=12)
+
+        # Adjust layout and save
+        fig.tight_layout()
+        filepath = f'{out_dir}/{uniq_id}.png'
+        plt.savefig(filepath, dpi=150, bbox_inches='tight')
+        logging.info(f"Saved diarization heatmap: {filepath}")
+        # Clean up the colorbar for the next iteration
+        cbar.remove()

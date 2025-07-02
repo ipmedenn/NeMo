@@ -624,7 +624,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         # forward pass for inference
         spkcache_fifo_chunk_preds = self.forward_infer(
-            spkcache_fifo_chunk_fc_encoder_embs, spkcache_fifo_chunk_fc_encoder_lengths
+            emb_seq=spkcache_fifo_chunk_fc_encoder_embs, emb_seq_length=spkcache_fifo_chunk_fc_encoder_lengths
         )
         return spkcache_fifo_chunk_preds, chunk_pre_encode_embs, chunk_pre_encode_lengths
 
@@ -693,7 +693,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             feat_seq_length=processed_signal_length,
             feat_seq_offset=processed_signal_offset,
         )
-        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
+        for chunk_idx, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
             streaming_loader,
             total=num_chunks,
             desc="Streaming Steps",
@@ -1033,8 +1033,16 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             self.batch_f1_accs_ats_list,
         ) = ([], [], [], [], [])
 
+        if self.sortformer_modules.visualization:
+            self.sortformer_modules.init_visualization_lists()
+
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self._test_dl)):
+                if self.sortformer_modules.visualization:
+                    self.sortformer_modules.spkcache_preds_list.append([])
+                    self.sortformer_modules.fifo_preds_list.append([])
+                    self.sortformer_modules.chunk_preds_list.append([])
+
                 audio_signal, audio_signal_length, targets, target_lens = batch
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
