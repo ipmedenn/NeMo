@@ -479,9 +479,8 @@ class TransformerEncoder(nn.Module):
                 dropout_rate_emb=dropout_emb,
             )
         elif self_attention_model == "rope":
-            # 'rope' adds no additive positional embedding to the signal; rotation is applied to
-            # Q/K inside each attention layer. The pre-encoder dropout (normally inside the
-            # positional encoding) is applied separately in forward_internal.
+            # RoPE has no additive pos-emb step to host dropout, so pre-encoder
+            # dropout is applied separately in forward_internal.
             self.dropout_pre_encoder = nn.Dropout(dropout_pre_encoder)
             self.pos_enc = RotaryPositionalEncoding(
                 d_k=d_model // n_heads,
@@ -560,8 +559,7 @@ class TransformerEncoder(nn.Module):
             length = length.to(torch.int64)
 
         if self.self_attention_model == "rope":
-            # 'rope' adds no additive positional embedding; Q/K are rotated inside attention.
-            # Apply xscale (if set) and the pre-encoder dropout to the pre-encoder output here.
+            # RoPE: no pos emb added; just apply xscale (if set) + pre-encoder dropout here.
             if self.xscale:
                 x = x * self.xscale
             x = self.dropout_pre_encoder(x)
