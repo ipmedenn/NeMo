@@ -124,6 +124,7 @@ class SortformerModules(NeuralModule, Exportable):
         self.hidden_size = tf_d_model
         self.n_spk: int = num_spks
         self.hidden_to_spks = nn.Linear(2 * self.hidden_size, self.n_spk)
+        self.hidden_to_spks.requires_grad_(False)
         self.first_hidden_to_hidden = nn.Linear(self.hidden_size, self.hidden_size)
         self.single_hidden_to_spks = nn.Linear(self.hidden_size, self.n_spk)
         self.dropout = nn.Dropout(dropout_rate)
