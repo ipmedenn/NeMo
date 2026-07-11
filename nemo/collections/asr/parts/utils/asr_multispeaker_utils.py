@@ -289,7 +289,7 @@ def get_pil_targets_hungarian(
         permutation_matrix = labels.new_zeros((batch_size, num_label_speakers, num_pred_speakers))
         batch_indices = torch.arange(batch_size, device=labels.device).unsqueeze(1).expand_as(batch_row_indices)
         permutation_matrix[batch_indices, batch_row_indices, batch_col_indices] = 1
-        aligned_labels = torch.matmul(labels, permutation_matrix)
+        aligned_labels = torch.matmul(labels, permutation_matrix).to(labels.dtype)
 
         speaker_indices = torch.full((batch_size, num_pred_speakers), -1, device=labels.device, dtype=torch.long)
         matched_speakers_are_active = active_speakers[batch_indices, batch_row_indices]

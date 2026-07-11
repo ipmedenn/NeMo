@@ -400,6 +400,8 @@ class TestHungarianTargetGenerators:
             pil_result, _ = get_pil_targets_hungarian(labels, preds)
             ats_result, _ = get_ats_targets_hungarian(labels, preds)
 
+        assert pil_result.dtype == labels.dtype
+        assert ats_result.dtype == labels.dtype
         assert torch.equal(pil_result, preds)
         assert torch.equal(ats_result, labels)
 
