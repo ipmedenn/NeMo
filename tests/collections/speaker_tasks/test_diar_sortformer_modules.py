@@ -1353,6 +1353,62 @@ class TestSortformerModules_StreamingScoreComputations:
             assert edge_spkcache.shape == (batch_size, spkcache_len, emb_dim)
             assert edge_spkcache_preds.shape == (batch_size, spkcache_len, n_spk)
 
+    @pytest.mark.unit
+    def test_compress_spkcache_with_learnable_silence_embedding(self):
+        sortformer_modules = SortformerModules(
+            num_spks=2,
+            fc_d_model=4,
+            spkcache_len=6,
+            spkcache_sil_frames_per_spk=1,
+            use_learnable_sil_emb=True,
+        )
+        sortformer_modules.eval()
+        learned_silence = torch.tensor([4.0, 3.0, 2.0, 1.0])
+        with torch.no_grad():
+            sortformer_modules.learnable_sil_emb.copy_(learned_silence)
+
+        emb_seq = torch.arange(32, dtype=torch.float32).reshape(1, 8, 4)
+        preds = torch.tensor([[[0.9, 0.1], [0.1, 0.9]] * 4])
+        running_mean_silence = torch.full((1, 4), -1.0)
+
+        spkcache, spkcache_preds, _ = sortformer_modules._compress_spkcache(emb_seq, preds, running_mean_silence)
+        silence_slots = torch.all(spkcache_preds == 0, dim=2)
+
+        assert silence_slots.sum() == 2
+        assert torch.equal(spkcache[silence_slots], learned_silence.expand(2, -1))
+        assert "learnable_sil_emb" in sortformer_modules.state_dict()
+
+        spkcache.sum().backward()
+        assert torch.equal(sortformer_modules.learnable_sil_emb.grad, torch.full((4,), 2.0))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("async_streaming", [False, True])
+    def test_learnable_silence_embedding_skips_running_profile_update(self, async_streaming):
+        sortformer_modules = SortformerModules(
+            num_spks=2,
+            fc_d_model=4,
+            spkcache_len=6,
+            fifo_len=0,
+            chunk_len=3,
+            spkcache_update_period=3,
+            spkcache_sil_frames_per_spk=1,
+            use_learnable_sil_emb=True,
+        )
+        streaming_state = sortformer_modules.init_streaming_state(batch_size=1, async_streaming=async_streaming)
+        chunk = torch.ones(1, 3, 4)
+
+        if async_streaming:
+            preds = torch.zeros(1, sortformer_modules.spkcache_len + chunk.shape[1], 2)
+            streaming_state, _ = sortformer_modules.streaming_update_async(
+                streaming_state, chunk, torch.tensor([chunk.shape[1]]), preds
+            )
+        else:
+            preds = torch.zeros(1, chunk.shape[1], 2)
+            streaming_state, _ = sortformer_modules.streaming_update(streaming_state, chunk, preds)
+
+        assert torch.count_nonzero(streaming_state.mean_sil_emb) == 0
+        assert torch.count_nonzero(streaming_state.n_sil_frames) == 0
+
 
 class TestSortformerModules_StreamingUpdate:
     @pytest.mark.unit
