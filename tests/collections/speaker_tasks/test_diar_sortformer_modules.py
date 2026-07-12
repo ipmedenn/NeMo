@@ -273,6 +273,78 @@ class TestSortformerModules_GeneralUtils:
         assert torch.allclose(full_masked_preds, spkcache_fifo_chunk_preds)
 
 
+class TestSortformerModules_HighResolution:
+    @pytest.mark.unit
+    def test_upsampler_is_parameter_free_by_default(self):
+        sortformer_modules = SortformerModules(tf_d_model=4)
+        hidden = torch.randn(2, 5, 4)
+
+        result = sortformer_modules.upsample_hidden(hidden)
+
+        assert result is hidden
+        assert not any("subpixel_upsample" in key for key in sortformer_modules.state_dict())
+
+    @pytest.mark.unit
+    def test_upsampler_initializes_as_repeat_interleave(self):
+        sortformer_modules = SortformerModules(tf_d_model=4, upsample_factor=3)
+        hidden = torch.randn(2, 5, 4, requires_grad=True)
+
+        result = sortformer_modules.upsample_hidden(hidden)
+
+        assert result.shape == (2, 15, 4)
+        assert torch.allclose(result, hidden.repeat_interleave(3, dim=1))
+        assert "subpixel_upsample.weight" in sortformer_modules.state_dict()
+        result.sum().backward()
+        assert hidden.grad is not None
+        assert sortformer_modules.subpixel_upsample.weight.grad is not None
+
+    @pytest.mark.unit
+    def test_upsampler_supports_bfloat16_autocast(self):
+        sortformer_modules = SortformerModules(tf_d_model=4, upsample_factor=2)
+        hidden = torch.randn(2, 5, 4)
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            result = sortformer_modules.upsample_hidden(hidden)
+
+        assert result.dtype == torch.bfloat16
+        assert result.shape == (2, 10, 4)
+        assert torch.allclose(result.float(), hidden.repeat_interleave(2, dim=1), atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.unit
+    def test_downsample_preds_averages_full_and_partial_windows(self):
+        preds = torch.tensor([[[1.0], [3.0], [5.0], [7.0], [9.0]]])
+
+        result = SortformerModules.downsample_preds(preds, downsample_factor=2)
+
+        assert torch.equal(result, torch.tensor([[[2.0], [6.0], [9.0]]]))
+
+    @pytest.mark.unit
+    def test_downsample_preds_excludes_per_sample_padding(self):
+        preds = torch.tensor(
+            [
+                [[1.0], [3.0], [5.0], [7.0], [9.0]],
+                [[1.0], [3.0], [5.0], [0.0], [0.0]],
+            ]
+        )
+
+        result = SortformerModules.downsample_preds(
+            preds,
+            downsample_factor=2,
+            lengths=torch.tensor([5, 3]),
+        )
+
+        assert torch.equal(result[0], torch.tensor([[2.0], [6.0], [9.0]]))
+        assert torch.equal(result[1], torch.tensor([[2.0], [5.0], [0.0]]))
+
+    @pytest.mark.unit
+    def test_downsample_preds_factor_one_returns_input(self):
+        preds = torch.randn(2, 5, 3)
+
+        result = SortformerModules.downsample_preds(preds, downsample_factor=1)
+
+        assert result is preds
+
+
 class TestSortformerModules_StreamingUtils:
     @pytest.mark.unit
     @pytest.mark.parametrize(

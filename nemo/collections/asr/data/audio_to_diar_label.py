@@ -55,6 +55,8 @@ def get_subsegments_to_timestamps(
         ts (torch.tensor):
             A tensor containing the scaled and rounded timestamps for each subsegment.
     """
+    if len(subsegments) == 0:
+        return torch.zeros((0, 2), dtype=torch.long)
     seg_ts = (torch.tensor(subsegments) * feat_per_sec).float()
     ts_round = torch.round(seg_ts, decimals=decimals)
     ts = ts_round.long()
@@ -339,8 +341,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 Tensor variable containing soft-labels of speaker activity in each step-level segment.
         """
         num_seg = torch.max(target_len)
-        targets = torch.zeros(num_seg, self.max_spks)
         stride = int(self.feat_per_sec * self.diar_frame_length)
+        if stride <= 1:
+            return feat_level_target[:num_seg, :].clone()
+
+        targets = torch.zeros(num_seg, self.max_spks)
         for index in range(num_seg):
             if index == 0:
                 seg_stt_feat = 0
@@ -372,6 +377,11 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
                 Number of segments for each scale. This information is used for reshaping embedding batch
                 during forward propagation.
         """
+        stride = int(self.feat_per_sec * self.diar_frame_length)
+        if stride <= 1:
+            num_frames = int(np.ceil((1 + duration * sample_rate) / int(sample_rate / self.feat_per_sec)))
+            return torch.tensor([num_frames])
+
         subsegments = get_subsegments(
             offset=offset,
             window=round(self.diar_frame_length * 2, self.round_digits),
@@ -524,6 +534,8 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             Global rank of the current process (used for distributed training).
         soft_targets (bool):
             Whether or not to use soft targets during training.
+        subsampling_factor (int):
+            Number of feature frames represented by each diarization target frame.
 
     Methods:
         eesd_train_collate_fn(batch):
@@ -543,6 +555,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
         global_rank: int,
         soft_targets: bool,
         device: str,
+        subsampling_factor: int = 8,
     ):
         super().__init__(
             manifest_filepath=manifest_filepath,
@@ -554,6 +567,7 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
             window_stride=window_stride,
             global_rank=global_rank,
             soft_targets=soft_targets,
+            subsampling_factor=subsampling_factor,
             device=device,
         )
 

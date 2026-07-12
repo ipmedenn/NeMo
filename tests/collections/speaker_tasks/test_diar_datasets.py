@@ -19,7 +19,10 @@ import tempfile
 import pytest
 import torch.cuda
 
-from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
+from nemo.collections.asr.data.audio_to_diar_label import (
+    AudioToSpeechE2ESpkDiarDataset,
+    get_subsegments_to_timestamps,
+)
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.utils.speaker_utils import get_vad_out_from_rttm_line, read_rttm_lines
 
@@ -44,9 +47,16 @@ def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec):
 
 
 class TestAudioToSpeechE2ESpkDiarDataset:
+    @pytest.mark.unit
+    def test_empty_subsegments_to_timestamps(self):
+        timestamps = get_subsegments_to_timestamps([])
+
+        assert timestamps.shape == (0, 2)
+        assert timestamps.dtype == torch.long
 
     @pytest.mark.unit
-    def test_e2e_speaker_diar_dataset(self, test_data_dir):
+    @pytest.mark.parametrize("subsampling_factor", [1, 4])
+    def test_e2e_speaker_diar_dataset(self, test_data_dir, subsampling_factor):
         manifest_path = os.path.abspath(os.path.join(test_data_dir, 'asr/diarizer/lsm_val.json'))
 
         batch_size = 4
@@ -82,9 +92,11 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                 window_stride=0.01,
                 global_rank=0,
                 soft_targets=False,
+                subsampling_factor=subsampling_factor,
                 device=device,
                 fb_featurizer=fb_featurizer,
             )
+            assert dataset.subsampling_factor == subsampling_factor
             dataloader_instance = torch.utils.data.DataLoader(
                 dataset=dataset,
                 batch_size=batch_size,

@@ -115,12 +115,16 @@ class SortformerModules(NeuralModule, Exportable):
         weak_boost_rate: float = 1.5,
         min_pos_scores_rate: float = 0.5,
         use_learnable_sil_emb: bool = False,
+        upsample_factor: int = 1,
     ):
         super().__init__()
+        if not isinstance(upsample_factor, int) or isinstance(upsample_factor, bool) or upsample_factor < 1:
+            raise ValueError(f"upsample_factor must be a positive integer, got {upsample_factor}")
         # General params
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
+        self.upsample_factor = upsample_factor
         self.hidden_size = tf_d_model
         self.n_spk: int = num_spks
         self.hidden_to_spks = nn.Linear(2 * self.hidden_size, self.n_spk)
@@ -129,6 +133,23 @@ class SortformerModules(NeuralModule, Exportable):
         self.single_hidden_to_spks = nn.Linear(self.hidden_size, self.n_spk)
         self.dropout = nn.Dropout(dropout_rate)
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
+        self.subpixel_upsample = None
+        if self.upsample_factor > 1:
+            self.subpixel_upsample = nn.Conv1d(
+                in_channels=self.tf_d_model,
+                out_channels=self.tf_d_model * self.upsample_factor,
+                kernel_size=3,
+                padding=1,
+            )
+            with torch.no_grad():
+                self.subpixel_upsample.weight.zero_()
+                repeat_identity = torch.eye(
+                    self.tf_d_model,
+                    device=self.subpixel_upsample.weight.device,
+                    dtype=self.subpixel_upsample.weight.dtype,
+                ).repeat(self.upsample_factor, 1)
+                self.subpixel_upsample.weight[:, :, 1].copy_(repeat_identity)
+                self.subpixel_upsample.bias.zero_()
         self.log = False
 
         # Streaming-related params
@@ -279,6 +300,62 @@ class SortformerModules(NeuralModule, Exportable):
         spk_preds = self.single_hidden_to_spks(hidden_out)
         preds = F.sigmoid(spk_preds)
         return preds
+
+    def upsample_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Upsample transformer hidden states when high-resolution output is enabled."""
+        if self.subpixel_upsample is None:
+            return hidden_states
+        batch_size, num_frames, hidden_size = hidden_states.shape
+        projected = self.subpixel_upsample(hidden_states.transpose(1, 2)).transpose(1, 2)
+        return projected.reshape(batch_size, num_frames, self.upsample_factor, hidden_size).reshape(
+            batch_size, num_frames * self.upsample_factor, hidden_size
+        )
+
+    @staticmethod
+    def downsample_preds(preds: torch.Tensor, downsample_factor: int, lengths: torch.Tensor = None) -> torch.Tensor:
+        """
+        Average non-overlapping prediction windows while retaining a partial final window.
+
+        Args:
+            preds: Speaker probabilities with shape ``(B, T, S)``.
+            downsample_factor: Number of consecutive input frames per output frame.
+            lengths: Optional valid input lengths with shape ``(B,)``. When provided,
+                padded frames are excluded from each sample's final partial-window average.
+
+        Returns:
+            Downsampled probabilities with time length ``ceil(T / downsample_factor)``.
+        """
+        if not isinstance(downsample_factor, int) or isinstance(downsample_factor, bool) or downsample_factor < 1:
+            raise ValueError(f"downsample_factor must be a positive integer, got {downsample_factor}")
+        if preds.ndim != 3:
+            raise ValueError(f"preds must have shape (B, T, S), got {preds.shape}")
+        if downsample_factor == 1 or preds.shape[1] == 0:
+            return preds
+
+        def pool(values):
+            return F.avg_pool1d(
+                values,
+                kernel_size=downsample_factor,
+                stride=downsample_factor,
+                ceil_mode=True,
+                count_include_pad=False,
+            )
+
+        preds = preds.transpose(1, 2)
+        if lengths is not None:
+            if lengths.shape != (preds.shape[0],):
+                raise ValueError(f"lengths must have shape {(preds.shape[0],)}, got {lengths.shape}")
+            num_frames = preds.shape[2]
+            lengths = lengths.to(device=preds.device).clamp(min=0, max=num_frames)
+            valid_mask = (torch.arange(num_frames, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)).unsqueeze(
+                1
+            )
+            valid_mask = valid_mask.to(preds.dtype)
+            pooled_mask = pool(valid_mask)
+            preds = pool(preds * valid_mask) / pooled_mask.clamp_min(torch.finfo(preds.dtype).eps)
+        else:
+            preds = pool(preds)
+        return preds.transpose(1, 2)
 
     @staticmethod
     def concat_embs(

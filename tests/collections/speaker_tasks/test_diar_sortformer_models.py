@@ -12,21 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 import torch
+from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
+    configure_output_subsampling_factor,
+)
 from omegaconf import DictConfig
 
 from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 
 
-@pytest.fixture()
-def sortformer_model():
+class RecordingSpecAugment(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_shapes = []
+
+    def forward(self, input_spec, length):
+        self.input_shapes.append(tuple(input_spec.shape))
+        return input_spec
+
+
+def _create_sortformer_model(high_resolution=False, output_subsampling_factor=None):
+    if output_subsampling_factor is None:
+        output_subsampling_factor = 1 if high_resolution else 8
 
     model = {
         'sample_rate': 16000,
         'pil_weight': 0.5,
         'ats_weight': 0.5,
         'max_num_of_spks': 4,
+        'high_resolution': high_resolution,
+        'output_subsampling_factor': output_subsampling_factor,
         'async_streaming': False,
         'streaming_mode': False,
     }
@@ -111,6 +132,8 @@ def sortformer_model():
             'pil_weight': 0.5,
             'ats_weight': 0.5,
             'max_num_of_spks': 4,
+            'high_resolution': high_resolution,
+            'output_subsampling_factor': output_subsampling_factor,
             'model_defaults': DictConfig(model_defaults),
             'encoder': DictConfig(encoder),
             'transformer_encoder': DictConfig(transformer_encoder),
@@ -126,6 +149,11 @@ def sortformer_model():
     )
     model = SortformerEncLabelModel(cfg=modelConfig)
     return model
+
+
+@pytest.fixture()
+def sortformer_model():
+    return _create_sortformer_model()
 
 
 class TestSortformerEncLabelModelOffline:
@@ -181,6 +209,36 @@ class TestSortformerEncLabelModelStreaming:
         assert isinstance(instance2, SortformerEncLabelModel)
 
     @pytest.mark.unit
+    def test_call_pre_encode_with_feature_stacking(self, sortformer_model):
+        sortformer_model.encoder.pre_encode = FeatureStacking(
+            subsampling_factor=8,
+            feat_in=80,
+            feat_out=sortformer_model._cfg.model_defaults.fc_d_model,
+        )
+        features = torch.randn(2, 120, 80)
+        lengths = torch.tensor([120, 91])
+
+        encoded, encoded_lengths = sortformer_model._call_pre_encode(features, lengths)
+
+        assert encoded.shape == (2, 15, sortformer_model._cfg.model_defaults.fc_d_model)
+        assert torch.equal(encoded_lengths, torch.tensor([15, 12]))
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("streaming_mode", [False, True])
+    def test_spec_augment_is_applied_once_in_forward(self, sortformer_model, streaming_mode):
+        sortformer_model.streaming_mode = streaming_mode
+        sortformer_model.train()
+        spec_augmentation = RecordingSpecAugment()
+        sortformer_model.spec_augmentation = spec_augmentation
+        audio = torch.randn(1, 8000)
+        audio_length = torch.tensor([8000])
+
+        sortformer_model(audio, audio_length)
+
+        assert len(spec_augmentation.input_shapes) == 1
+        assert spec_augmentation.input_shapes[0][:2] == (1, 80)
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "batch_size, sample_len",
         [
@@ -212,3 +270,322 @@ class TestSortformerEncLabelModelStreaming:
         assert diff <= 1e-6
         diff = torch.max(torch.abs(preds_instance - preds_batch))
         assert diff <= 1e-6
+
+
+class TestSortformerEncLabelModelHighResolution:
+    @pytest.mark.unit
+    def test_non_strict_warm_start_from_legacy_state_dict(self):
+        low_resolution_model = _create_sortformer_model().eval()
+        high_resolution_model = _create_sortformer_model(high_resolution=True).eval()
+
+        load_result = high_resolution_model.load_state_dict(low_resolution_model.state_dict(), strict=False)
+        emb_seq = torch.randn(2, 5, low_resolution_model._cfg.model_defaults.tf_d_model)
+        emb_seq_length = torch.tensor([5, 4])
+        with torch.no_grad():
+            low_resolution_preds = low_resolution_model.forward_infer(emb_seq, emb_seq_length)
+            high_resolution_preds = high_resolution_model.forward_infer(emb_seq, emb_seq_length)
+
+        assert set(load_result.missing_keys) == {
+            "sortformer_modules.subpixel_upsample.weight",
+            "sortformer_modules.subpixel_upsample.bias",
+        }
+        assert not load_result.unexpected_keys
+        assert torch.allclose(
+            high_resolution_preds,
+            low_resolution_preds.repeat_interleave(high_resolution_model.upsample_factor, dim=1),
+        )
+
+    @pytest.mark.unit
+    def test_constructor_and_exact_output_length(self):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        audio = torch.randn(2, 16000)
+        lengths = torch.tensor([16000, 12000], dtype=torch.long)
+
+        with torch.no_grad():
+            _, feature_lengths = model.process_signal(audio, lengths)
+            preds = model(audio, lengths)
+
+        assert model.high_resolution
+        assert model.upsample_factor == model.encoder.subsampling_factor
+        assert model.output_subsampling_factor == 1
+        assert preds.shape[1] == feature_lengths.max()
+        assert torch.count_nonzero(preds[1, feature_lengths[1] :]) == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("output_subsampling_factor", [1, 2, 3, 8, 16])
+    def test_forward_returns_configured_output_resolution(self, output_subsampling_factor):
+        model = _create_sortformer_model(
+            high_resolution=True,
+            output_subsampling_factor=output_subsampling_factor,
+        ).eval()
+        audio = torch.randn(2, 8000)
+        lengths = torch.tensor([8000, 6400], dtype=torch.long)
+
+        with torch.no_grad():
+            _, feature_lengths = model.process_signal(audio, lengths)
+            preds = model(audio, lengths)
+
+        expected_max_length = math.ceil(feature_lengths.max().item() / output_subsampling_factor)
+        second_length = math.ceil(feature_lengths[1].item() / output_subsampling_factor)
+        assert preds.shape[1] == expected_max_length
+        assert torch.count_nonzero(preds[1, second_length:]) == 0
+
+    @pytest.mark.unit
+    def test_low_resolution_overrides_output_subsampling_factor(self):
+        model = _create_sortformer_model(
+            high_resolution=False,
+            output_subsampling_factor=3,
+        )
+
+        assert model.output_subsampling_factor == model.encoder.subsampling_factor
+        assert model.upsample_factor == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("output_subsampling_factor", [16, 24])
+    def test_low_resolution_forward_can_downsample_further(self, output_subsampling_factor):
+        model = _create_sortformer_model(
+            high_resolution=False,
+            output_subsampling_factor=output_subsampling_factor,
+        ).eval()
+        audio = torch.randn(2, 8000)
+        lengths = torch.tensor([8000, 6400], dtype=torch.long)
+
+        with torch.no_grad():
+            _, feature_lengths = model.process_signal(audio, lengths)
+            preds = model(audio, lengths)
+
+        assert preds.shape[1] == math.ceil(feature_lengths.max().item() / output_subsampling_factor)
+        assert model.sortformer_modules.subpixel_upsample is None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "high_resolution, requested_factor, expected_factor",
+        [(True, 3, 3), (False, 3, 8), (False, 16, 16), (True, None, 1)],
+    )
+    def test_inference_output_subsampling_override(self, high_resolution, requested_factor, expected_factor):
+        model = _create_sortformer_model(high_resolution=high_resolution)
+
+        result = configure_output_subsampling_factor(model, requested_factor)
+
+        assert result == expected_factor
+        assert model.output_subsampling_factor == expected_factor
+        assert model._cfg.output_subsampling_factor == expected_factor
+
+    @pytest.mark.unit
+    def test_inference_output_subsampling_override_rejects_invalid_factor(self):
+        model = _create_sortformer_model(high_resolution=True)
+
+        with pytest.raises(ValueError, match="output_subsampling_factor must be a positive integer"):
+            configure_output_subsampling_factor(model, 0)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("output_subsampling_factor", [0, -1, 1.5, True])
+    def test_output_subsampling_factor_must_be_a_positive_integer(self, output_subsampling_factor):
+        with pytest.raises(ValueError, match="output_subsampling_factor must be a positive integer"):
+            _create_sortformer_model(
+                high_resolution=True,
+                output_subsampling_factor=output_subsampling_factor,
+            )
+
+    @pytest.mark.unit
+    def test_high_resolution_training_loss_is_finite_and_updates_upsampler(self):
+        model = _create_sortformer_model(high_resolution=True).train()
+        model._optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        audio = torch.randn(2, 8000)
+        audio_lengths = torch.tensor([8000, 6400], dtype=torch.long)
+        preds = model(audio, audio_lengths)
+        targets = (torch.rand_like(preds) > 0.5).to(preds.dtype)
+        target_lens = torch.tensor([preds.shape[1], preds.shape[1] - 5])
+
+        metrics = model._get_aux_train_evaluations(preds, targets, target_lens)
+        metrics["loss"].backward()
+
+        assert torch.isfinite(metrics["loss"])
+        assert model.sortformer_modules.subpixel_upsample.weight.grad is not None
+
+    @pytest.mark.unit
+    def test_high_resolution_bfloat16_mixed_loss_is_finite(self):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        audio = torch.randn(2, 4000)
+        audio_lengths = torch.tensor([4000, 3200], dtype=torch.long)
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            preds = model(audio, audio_lengths)
+            targets = (torch.rand_like(preds) > 0.5).to(preds.dtype)
+            target_lens = torch.tensor([preds.shape[1], preds.shape[1] - 3])
+            metrics = model._get_aux_validation_evaluations(preds, targets, target_lens)
+
+        assert torch.isfinite(metrics["val_loss"])
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("output_subsampling_factor", [1, 3, 16])
+    def test_legacy_dataloader_uses_high_resolution_targets(self, output_subsampling_factor):
+        model = _create_sortformer_model(
+            high_resolution=True,
+            output_subsampling_factor=output_subsampling_factor,
+        )
+        dataset = SimpleNamespace(collection=[], eesd_train_collate_fn=lambda batch: batch)
+        config = DictConfig(
+            {
+                "manifest_filepath": "unused.json",
+                "sample_rate": 16000,
+                "soft_label_thres": 0.5,
+                "session_len_sec": 1,
+                "num_spks": 4,
+                "soft_targets": False,
+                "batch_size": 1,
+                "num_workers": 0,
+                "use_lhotse": False,
+            }
+        )
+
+        with patch(
+            "nemo.collections.asr.models.sortformer_diar_models.AudioToSpeechE2ESpkDiarDataset",
+            return_value=dataset,
+        ) as dataset_constructor:
+            model._SortformerEncLabelModel__setup_dataloader_from_config(config)
+
+        assert dataset_constructor.call_args.kwargs["subsampling_factor"] == output_subsampling_factor
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("output_subsampling_factor", [1, 3, 16])
+    def test_lhotse_dataloader_uses_high_resolution_targets(self, output_subsampling_factor):
+        model = _create_sortformer_model(
+            high_resolution=True,
+            output_subsampling_factor=output_subsampling_factor,
+        )
+        config = DictConfig({"use_lhotse": True})
+
+        with (
+            patch(
+                "nemo.collections.asr.models.sortformer_diar_models.LhotseAudioToSpeechE2ESpkDiarDataset"
+            ) as dataset_constructor,
+            patch(
+                "nemo.collections.asr.models.sortformer_diar_models.get_lhotse_dataloader_from_config",
+                return_value=object(),
+            ),
+        ):
+            model._SortformerEncLabelModel__setup_dataloader_from_config(config)
+
+        assert dataset_constructor.call_args.kwargs["cfg"].subsampling_factor == output_subsampling_factor
+
+    @pytest.mark.unit
+    def test_forward_infer_repeats_encoder_mask_at_high_resolution(self):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        emb_seq = torch.randn(2, 3, model._cfg.model_defaults.tf_d_model)
+        emb_seq_length = torch.tensor([3, 2])
+
+        with torch.no_grad():
+            preds = model.forward_infer(emb_seq, emb_seq_length)
+
+        assert preds.shape == (2, 24, model._cfg.max_num_of_spks)
+        assert torch.count_nonzero(preds[1, 16:]) == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("async_streaming", [False, True])
+    @pytest.mark.parametrize(
+        "high_resolution, output_subsampling_factor",
+        [(True, 1), (True, 3), (True, 16), (False, 16)],
+    )
+    def test_full_streaming_output_uses_configured_resolution(
+        self, async_streaming, high_resolution, output_subsampling_factor
+    ):
+        model = _create_sortformer_model(
+            high_resolution=high_resolution,
+            output_subsampling_factor=output_subsampling_factor,
+        ).eval()
+        model.streaming_mode = True
+        model.async_streaming = async_streaming
+        audio = torch.randn(1, 8000)
+        audio_lengths = torch.tensor([8000], dtype=torch.long)
+
+        with torch.no_grad():
+            _, feature_lengths = model.process_signal(audio, audio_lengths)
+            preds = model(audio, audio_lengths)
+
+        assert preds.shape[1] == math.ceil(feature_lengths.item() / output_subsampling_factor)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("async_streaming", [False, True])
+    def test_streaming_emits_fine_predictions_and_updates_cache_with_coarse_predictions(self, async_streaming):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        model.streaming_mode = True
+        model.async_streaming = async_streaming
+        processed_signal = torch.randn(1, 120, 80)
+        processed_signal_length = torch.tensor([120])
+        streaming_state = model.sortformer_modules.init_streaming_state(batch_size=1, async_streaming=async_streaming)
+        total_preds = torch.zeros(1, 0, model._cfg.max_num_of_spks)
+        captured = {}
+
+        def capture_streaming_update(**kwargs):
+            captured["preds"] = kwargs["preds"]
+            return streaming_update(**kwargs)
+
+        if async_streaming:
+            streaming_update = model.sortformer_modules.streaming_update_async
+            model.sortformer_modules.streaming_update_async = capture_streaming_update
+        else:
+            streaming_update = model.sortformer_modules.streaming_update
+            model.sortformer_modules.streaming_update = capture_streaming_update
+        with torch.no_grad():
+            _, total_preds = model.forward_streaming_step(
+                processed_signal,
+                processed_signal_length,
+                streaming_state,
+                total_preds,
+            )
+
+        assert total_preds.shape[1] == captured["preds"].shape[1] * model.upsample_factor
+
+    @pytest.mark.unit
+    def test_streaming_export_keeps_coarse_prediction_resolution(self):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        chunk = torch.randn(1, 120, 80)
+        chunk_lengths = torch.tensor([120])
+        spkcache = torch.zeros(1, 0, model._cfg.model_defaults.fc_d_model)
+        spkcache_lengths = torch.zeros(1, dtype=torch.long)
+        fifo = torch.zeros(1, 0, model._cfg.model_defaults.fc_d_model)
+        fifo_lengths = torch.zeros(1, dtype=torch.long)
+
+        with torch.no_grad():
+            preds, _, chunk_pre_encode_lengths = model.forward_for_export(
+                chunk,
+                chunk_lengths,
+                spkcache,
+                spkcache_lengths,
+                fifo,
+                fifo_lengths,
+            )
+
+        assert preds.shape[1] == chunk_pre_encode_lengths.max()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "high_resolution, output_subsampling_factor, expected_frame_count",
+        [(False, 3, 8), (True, 1, 1), (True, 3, 3)],
+    )
+    def test_diarize_postprocessing_uses_native_output_step(
+        self, high_resolution, output_subsampling_factor, expected_frame_count
+    ):
+        model = _create_sortformer_model(
+            high_resolution=high_resolution,
+            output_subsampling_factor=output_subsampling_factor,
+        ).eval()
+        model._diarize_audio_rttm_map = {"sample": {"offset": 0.0}}
+        outputs = torch.zeros(1, 3, model._cfg.max_num_of_spks)
+        diarize_config = SimpleNamespace(postprocessing_params=None, include_tensor_outputs=False)
+
+        with (
+            patch(
+                "nemo.collections.asr.models.sortformer_diar_models.ts_vad_post_processing",
+                return_value=torch.empty(0, 2),
+            ) as postprocess,
+            patch(
+                "nemo.collections.asr.models.sortformer_diar_models.generate_diarization_output_lines",
+                return_value=[],
+            ),
+        ):
+            model._diarize_output_processing(outputs, ["sample"], diarize_config)
+
+        assert postprocess.call_count == model._cfg.max_num_of_spks
+        assert all(call.kwargs["unit_10ms_frame_count"] == expected_frame_count for call in postprocess.call_args_list)

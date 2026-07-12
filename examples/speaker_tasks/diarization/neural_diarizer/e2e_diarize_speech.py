@@ -46,7 +46,7 @@ from typing import Dict, List, Optional, Union
 
 import lightning.pytorch as pl
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.metrics.der import score_labels
@@ -91,6 +91,7 @@ class DiarizationConfig:
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
     log: bool = False  # If True, log will be printed
+    output_subsampling_factor: Optional[int] = None  # Override prediction step in 10 ms feature frames
 
     use_lhotse: bool = True
     batch_duration: int = 100000
@@ -119,6 +120,28 @@ class DiarizationConfig:
     optuna_storage: str = f"sqlite:///{optuna_study_name}.db"
     optuna_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
+
+
+def configure_output_subsampling_factor(
+    diar_model: SortformerEncLabelModel, output_subsampling_factor: Optional[int]
+) -> int:
+    """Apply an inference-time output resolution override and return the effective factor."""
+    if output_subsampling_factor is None:
+        return diar_model.output_subsampling_factor
+    if type(output_subsampling_factor) is not int or output_subsampling_factor < 1:
+        raise ValueError(f"output_subsampling_factor must be a positive integer, got {output_subsampling_factor}")
+    native_output_factor = 1 if diar_model.high_resolution else diar_model.encoder.subsampling_factor
+    if output_subsampling_factor % native_output_factor != 0:
+        logging.warning(
+            f"output_subsampling_factor={output_subsampling_factor} must be an integer multiple of the model's "
+            f"native subsampling factor ({native_output_factor}). Using {native_output_factor} instead."
+        )
+        output_subsampling_factor = native_output_factor
+
+    diar_model.output_subsampling_factor = output_subsampling_factor
+    with open_dict(diar_model._cfg):
+        diar_model._cfg.output_subsampling_factor = output_subsampling_factor
+    return output_subsampling_factor
 
 
 def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial) -> PostProcessingParams:
@@ -156,6 +179,7 @@ def get_tensor_path(cfg: DiarizationConfig) -> str:
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
     model_base_path = os.path.dirname(cfg.model_path)
     model_id = os.path.basename(cfg.model_path).replace(".ckpt", "").replace(".nemo", "")
+    model_id = f"{model_id}_sf{cfg.output_subsampling_factor}"
     bpath = f"{model_base_path}/pred_tensors"
     if not os.path.exists(bpath):
         os.makedirs(bpath)
@@ -169,6 +193,7 @@ def diarization_objective(
     temp_out_dir: str,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     diar_model_preds_total_list: List[torch.Tensor],
+    unit_10ms_frame_count: int,
     collar: float = 0.25,
     ignore_overlap: bool = False,
 ) -> float:
@@ -188,6 +213,7 @@ def diarization_objective(
         diar_model_preds_total_list (List[torch.Tensor]): List of prediction matrices containing
             sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        unit_10ms_frame_count (int): Number of 10 ms feature frames represented by each prediction frame.
         collar (float, optional): Collar in seconds for DER calculation. Defaults to 0.25.
         ignore_overlap (bool, optional): If True, DER will be calculated only for non-overlapping segments.
             Defaults to False.
@@ -202,7 +228,7 @@ def diarization_objective(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=unit_10ms_frame_count,
             bypass_postprocessing=False,
         )
         metric, _, _ = score_labels(
@@ -223,6 +249,7 @@ def run_optuna_hyperparam_search(
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    unit_10ms_frame_count: int,
 ):
     """
     Run Optuna hyperparameter optimization for speaker diarization.
@@ -234,6 +261,7 @@ def run_optuna_hyperparam_search(
         preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
         temp_out_dir (str): temporary directory for storing intermediate outputs.
+        unit_10ms_frame_count (int): Number of 10 ms feature frames represented by each prediction frame.
     """
     optuna = import_optional_dependency("optuna")
 
@@ -243,6 +271,7 @@ def run_optuna_hyperparam_search(
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict,
         diar_model_preds_total_list=preds_list,
+        unit_10ms_frame_count=unit_10ms_frame_count,
         collar=cfg.collar,
     )
     study = optuna.create_study(
@@ -348,6 +377,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
 
+    cfg.output_subsampling_factor = configure_output_subsampling_factor(diar_model, cfg.output_subsampling_factor)
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator, precision=cfg.precision)
     diar_model.set_trainer(trainer)
@@ -426,6 +456,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict=infer_audio_rttm_dict,
             preds_list=diar_model_preds_total_list,
             temp_out_dir=cfg.optuna_temp_dir,
+            unit_10ms_frame_count=cfg.output_subsampling_factor,
         )
 
     # Evaluation
@@ -438,7 +469,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=cfg.output_subsampling_factor,
             bypass_postprocessing=cfg.bypass_postprocessing,
             out_rttm_dir=cfg.out_rttm_dir,
         )

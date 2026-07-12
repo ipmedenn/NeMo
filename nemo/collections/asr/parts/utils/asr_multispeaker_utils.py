@@ -437,6 +437,9 @@ def get_soft_mask(feat_level_target, num_frames, stride):
             Dimension: (num_frames, num_speakers)
     """
 
+    if stride <= 1:
+        return feat_level_target[:num_frames, :].clone()
+
     num_speakers = feat_level_target.shape[1]
     mask = torch.zeros(num_frames, num_speakers)
 

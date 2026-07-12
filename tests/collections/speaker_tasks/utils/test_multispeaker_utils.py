@@ -24,6 +24,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_hidden_length_from_sample_length,
     get_pil_targets,
     get_pil_targets_hungarian,
+    get_soft_mask,
     reconstruct_labels,
 )
 
@@ -211,6 +212,19 @@ class TestSortingUtils:
 
 
 class TestTargetGenerators:
+    @pytest.mark.unit
+    def test_get_soft_mask_without_subsampling(self):
+        frame_targets = torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ]
+        )
+
+        result = get_soft_mask(frame_targets, num_frames=3, stride=1)
+
+        assert torch.equal(result, frame_targets)
 
     @pytest.mark.parametrize(
         "labels, preds, num_speakers, expected_output",
