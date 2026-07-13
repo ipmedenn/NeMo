@@ -29,6 +29,8 @@ from omegaconf import DictConfig
 from nemo.collections.asr.data.audio_to_diar_label import extract_frame_info_from_rttm, get_frame_targets_from_rttm
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.modules.sortformer_modules import StreamingSortformerState
+from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
+from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_soft_mask
 from nemo.collections.asr.parts.utils.diarization_utils import get_color_palette, print_sentences, write_txt
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
@@ -169,14 +171,18 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec
                 with open(rttm_path, 'r', encoding='utf-8') as f:
                     rttm_lines = f.readlines()
                 rttm_timestamps, _ = extract_frame_info_from_rttm(0, samples[-1]['duration'], rttm_lines)
-                rttm_mat = get_frame_targets_from_rttm(
+                feature_frame_len_sec = cfg.get("feat_len_sec", 0.01)
+                subsampling_factor = round(feat_per_sec / feature_frame_len_sec)
+                fine_rttm_mat = get_frame_targets_from_rttm(
                     rttm_timestamps=rttm_timestamps,
                     offset=0,
                     duration=samples[-1]['duration'],
                     round_digits=3,
-                    feat_per_sec=round(float(1 / feat_per_sec), 2),
+                    feat_per_sec=round(float(1 / feature_frame_len_sec), 2),
                     max_spks=max_spks,
                 )
+                target_len = math.ceil(samples[-1]['duration'] / feat_per_sec)
+                rttm_mat = (get_soft_mask(fine_rttm_mat, target_len, subsampling_factor) > 0.5).float()
                 rttms_mask_mats.append(rttm_mat)
             samples[-1]['duration'] = None
             if 'offset' not in item:
@@ -540,6 +546,7 @@ class SpeakerTaggedASR:
 
         self.asr_model = asr_model
         self.diar_model = diar_model
+        self._diar_uses_feature_stacking = isinstance(self.diar_model.encoder.pre_encode, FeatureStacking)
 
         # ASR speaker tagging configs
         self._fix_prev_words_count = cfg.fix_prev_words_count
@@ -1008,6 +1015,26 @@ class SpeakerTaggedASR:
             length = (length - drop_extra_pre_encoded).clamp(min=0)
         return audio_signal, length
 
+    def _prepare_diar_chunk(self, chunk_audio, chunk_lengths, drop_extra_pre_encoded):
+        """Adapt an ASR cache-aware chunk to the diarization model's pre-encoder geometry."""
+        if not self._diar_uses_feature_stacking:
+            return chunk_audio, chunk_lengths, drop_extra_pre_encoded
+
+        pre_encode_cache_size = self.asr_model.encoder.streaming_cfg.pre_encode_cache_size
+        if isinstance(pre_encode_cache_size, list):
+            pre_encode_cache_size = pre_encode_cache_size[1]
+        if pre_encode_cache_size <= 0:
+            return chunk_audio, chunk_lengths, 0
+        if chunk_audio.shape[-1] <= pre_encode_cache_size:
+            raise ValueError(
+                f"ASR chunk length ({chunk_audio.shape[-1]}) must be greater than its pre-encode cache "
+                f"({pre_encode_cache_size}) for FeatureStacking diarization."
+            )
+
+        diar_chunk_audio = chunk_audio[:, :, pre_encode_cache_size:]
+        diar_chunk_lengths = (chunk_lengths - pre_encode_cache_size).clamp(min=0, max=diar_chunk_audio.shape[-1])
+        return diar_chunk_audio, diar_chunk_lengths, 0
+
     def mask_features(
         self, chunk_audio: torch.Tensor, mask: torch.Tensor, threshold: float = 0.5, mask_value: float = -16.6355
     ) -> torch.Tensor:
@@ -1145,12 +1172,15 @@ class SpeakerTaggedASR:
 
         if self.diar_model.rttms_mask_mats is None:
 
+            diar_chunk_audio, diar_chunk_lengths, diar_drop_extra = self._prepare_diar_chunk(
+                chunk_audio, chunk_lengths, drop_extra_pre_encoded
+            )
             new_streaming_state, diar_pred_out_stream = self.diar_model.forward_streaming_step(
-                processed_signal=chunk_audio.transpose(1, 2),
-                processed_signal_length=chunk_lengths,
+                processed_signal=diar_chunk_audio.transpose(1, 2),
+                processed_signal_length=diar_chunk_lengths,
                 streaming_state=self.instance_manager.diar_states.streaming_state,
                 total_preds=self.instance_manager.diar_states.diar_pred_out_stream,
-                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                drop_extra_pre_encoded=diar_drop_extra,
             )
             self.instance_manager.update_diar_state(
                 diar_pred_out_stream=diar_pred_out_stream,
@@ -1232,12 +1262,15 @@ class SpeakerTaggedASR:
 
         # Step 2: diarize or get GT rttms
         if self.diar_model.rttms_mask_mats is None:
+            diar_chunk_audio, diar_chunk_lengths, diar_drop_extra = self._prepare_diar_chunk(
+                chunk_audio, chunk_lengths, drop_extra_pre_encoded
+            )
             new_streaming_state, new_diar_pred_out_stream = self.diar_model.forward_streaming_step(
-                processed_signal=chunk_audio.transpose(1, 2),
-                processed_signal_length=chunk_lengths,
+                processed_signal=diar_chunk_audio.transpose(1, 2),
+                processed_signal_length=diar_chunk_lengths,
                 streaming_state=self.instance_manager.diar_states.streaming_state,
                 total_preds=self.instance_manager.diar_states.diar_pred_out_stream,
-                drop_extra_pre_encoded=drop_extra_pre_encoded,
+                drop_extra_pre_encoded=diar_drop_extra,
             )
             new_chunk_preds = new_diar_pred_out_stream[:, -self._nframes_per_chunk :]
 
@@ -1621,10 +1654,6 @@ class MultiTalkerInstanceManager:
                         decoded_length_before=self._prev_decoded_lengths[spk_idx],
                     )
 
-                    # Update the stored decoded_length for this speaker
-                    if hypothesis.dec_state is not None:
-                        self._prev_decoded_lengths[spk_idx] = hypothesis.dec_state.decoded_length.item()
-
                     # Get the last end time of the previous sentence or None if no sentences are present
                     if len(self._speaker_wise_sentences[spk_idx]) > 0:
                         last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']
@@ -1656,6 +1685,8 @@ class MultiTalkerInstanceManager:
                 # Update the previous history of the speaker text
                 if hypothesis.text is not None:
                     self._prev_history_speaker_texts[spk_idx] = hypothesis.text
+                if hypothesis.dec_state is not None:
+                    self._prev_decoded_lengths[spk_idx] = hypothesis.dec_state.decoded_length.item()
                 self._prev_token_counts[spk_idx] = len(hypothesis.timestamp)
 
             self.seglsts = []

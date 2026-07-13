@@ -12,16 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, is_dataclass
+from pathlib import Path
 from typing import List, Optional, Union
 
 import pytorch_lightning as pl
 import torch
+from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import convert_pred_mat_to_segments
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
+from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
+from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     SpeakerTaggedASR,
     add_delay_for_real_time,
@@ -56,15 +63,18 @@ class MultitalkerTranscriptionConfig:
     num_workers: int = 8
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     log: bool = True  # If True,log will be printed
+    precision: str = "bf16"  # 32, bf16, bf16-mixed
 
     # Streaming diarization configs
     streaming_mode: bool = True  # If True, streaming diarization will be used.
     spkcache_len: int = 188
+    spkcache_update_period: int = 222
     spkcache_refresh_rate: int = 0
     fifo_len: int = 188
     chunk_len: int = 0
     chunk_left_context: int = 0
     chunk_right_context: int = 0
+    output_subsampling_factor: Optional[int] = None
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -86,6 +96,9 @@ class MultitalkerTranscriptionConfig:
     left_chunks: int = 2
     online_normalization: bool = False
     output_path: Optional[str] = None
+    diar_output_rttm_dir: Optional[str] = None
+    diar_collar: float = 0.0
+    diar_ignore_overlap: bool = False
     pad_and_drop_preencoded: bool = False
     generate_realtime_scripts: bool = False
     spk_supervision: str = "diar"  # ["diar", "rttm"]
@@ -108,6 +121,84 @@ class MultitalkerTranscriptionConfig:
     print_path: Optional[str] = None
     ignored_initial_frame_steps: int = 5
     finetune_realtime_ratio: float = 0.01
+
+
+def set_batch_rttm_masks(diar_model, rttms_mask_mats, batch_start: int, batch_size: int, device: torch.device):
+    """Attach only the ground-truth diarization masks corresponding to the current audio batch."""
+    batch_rttm_masks = rttms_mask_mats[batch_start : batch_start + batch_size]
+    if batch_rttm_masks.shape[0] != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} RTTM masks for batch starting at {batch_start}, "
+            f"but found {batch_rttm_masks.shape[0]}"
+        )
+    diar_model.rttms_mask_mats = batch_rttm_masks.to(device)
+
+
+def collect_diar_predictions(
+    diar_preds: torch.Tensor,
+    samples,
+    feature_lengths: torch.Tensor,
+    feature_frame_length_sec: float,
+    diar_frame_length_sec: float,
+):
+    """Collect valid, unpadded diarization predictions and their metadata."""
+    if diar_preds.shape[0] != len(samples) or len(samples) != len(feature_lengths):
+        raise ValueError(
+            f"Batch size mismatch: diar_preds={diar_preds.shape[0]}, samples={len(samples)}, "
+            f"feature_lengths={len(feature_lengths)}"
+        )
+
+    diar_preds = diar_preds.detach().cpu()
+    feature_lengths = feature_lengths.detach().cpu()
+    predictions, metadata = [], []
+
+    for batch_idx, sample in enumerate(samples):
+        duration = sample.get("duration")
+        if duration is None:
+            duration = feature_lengths[batch_idx].item() * feature_frame_length_sec
+        valid_frames = min(
+            diar_preds.shape[1],
+            math.ceil(duration / diar_frame_length_sec),
+        )
+        predictions.append(diar_preds[batch_idx : batch_idx + 1, :valid_frames])
+        sample_metadata = dict(sample)
+        sample_metadata["duration"] = duration
+        sample_metadata.setdefault("offset", 0.0)
+        metadata.append(sample_metadata)
+    return predictions, metadata
+
+
+def write_and_score_diar_predictions(predictions, samples, cfg, output_subsampling_factor):
+    """Convert predictions with the standalone e2e path, write RTTMs, and score when references exist."""
+    audio_rttm_map_dict = OrderedDict()
+    for sample in samples:
+        recording_id = Path(sample["audio_filepath"]).stem
+        audio_rttm_map_dict[recording_id] = sample
+
+    if cfg.diar_output_rttm_dir is not None:
+        Path(cfg.diar_output_rttm_dir).mkdir(parents=True, exist_ok=True)
+    all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
+        audio_rttm_map_dict=audio_rttm_map_dict,
+        postprocessing_cfg=None,
+        batch_preds_list=predictions,
+        unit_10ms_frame_count=output_subsampling_factor,
+        bypass_postprocessing=True,
+        out_rttm_dir=cfg.diar_output_rttm_dir,
+    )
+
+    has_references = all(sample.get("rttm_filepath") and os.path.exists(sample["rttm_filepath"]) for sample in samples)
+    if has_references:
+        logging.info(f"Calculating DER on {len(samples)} recordings...")
+        score_labels(
+            AUDIO_RTTM_MAP=audio_rttm_map_dict,
+            all_reference=all_refs,
+            all_hypothesis=all_hyps,
+            all_uem=all_uems,
+            collar=cfg.diar_collar,
+            ignore_overlap=cfg.diar_ignore_overlap,
+        )
+    elif any(sample.get("rttm_filepath") for sample in samples):
+        logging.warning("Skipping DER because one or more reference RTTM files do not exist.")
 
 
 def launch_serial_streaming(
@@ -247,21 +338,35 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model, map_location=map_location)
     else:
         raise ValueError("cfg.diar_model must end with.ckpt or.nemo!")
+    if cfg.output_subsampling_factor is not None:
+        diar_model.output_subsampling_factor = cfg.output_subsampling_factor
+
+    use_bf16 = accelerator == 'gpu' and cfg.precision.startswith("bf16") and torch.cuda.is_bf16_supported()
+    if cfg.precision.startswith("bf16") and not use_bf16:
+        logging.warning("BF16 precision was requested but is not supported on this device. Falling back to FP32.")
 
     # Model setup for inference
-    trainer = pl.Trainer(devices=device, accelerator=accelerator)
+    trainer = pl.Trainer(
+        devices=device,
+        accelerator=accelerator,
+        precision=cfg.precision if use_bf16 else "32",
+    )
     diar_model.set_trainer(trainer)
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     diar_model._cfg.test_ds.manifest_filepath = cfg.manifest_file
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     diar_model._cfg.test_ds.num_workers = cfg.num_workers
     diar_model.setup_test_data(test_data_config=diar_model._cfg.test_ds)
-    diar_model = diar_model.eval()
+    if use_bf16:
+        diar_model = diar_model.to(dtype=torch.bfloat16).eval()
+    else:
+        diar_model = diar_model.eval()
 
     # Steaming mode setup
     diar_model.streaming_mode = cfg.streaming_mode
     diar_model.sortformer_modules.chunk_len = cfg.chunk_len
     diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
+    diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
     diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
     diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
     diar_model.sortformer_modules.fifo_len = cfg.fifo_len
@@ -291,14 +396,18 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
         else:
             raise ValueError("Model does not support multiple lookaheads.")
 
-    global autocast
-    autocast = torch.amp.autocast(asr_model.device.type, enabled=cfg.use_amp)
-
     # Initialize to avoid "possibly used before assignment" error
     multispk_asr_streamer = None
 
     asr_model = asr_model.to(cfg.device)
-    asr_model.eval()
+    asr_model = asr_model.eval()
+
+    global autocast
+    autocast = torch.amp.autocast(
+        device_type=asr_model.device.type,
+        dtype=torch.bfloat16 if use_bf16 else asr_model.dtype,
+        enabled=cfg.use_amp and use_bf16,
+    )
 
     # chunk_size is set automatically for models trained for streaming.
     # For models trained for offline mode with full context, we need to pass the chunk_size explicitly.
@@ -311,7 +420,15 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
             chunk_size=cfg.chunk_size, left_chunks=cfg.left_chunks, shift_size=shift_size
         )
 
+    if isinstance(diar_model.encoder.pre_encode, FeatureStacking) and not cfg.pad_and_drop_preencoded:
+        logging.info(
+            "FeatureStacking diarization detected: enabling padded ASR pre-encode cache so diarization can consume "
+            "aligned cache-free chunks."
+        )
+        cfg.pad_and_drop_preencoded = True
+
     seglst_dict_list = []
+    diar_predictions, diar_samples = [], []
     if cfg.audio_file is not None:
         # Stream a single audio file
         samples = [
@@ -343,6 +460,17 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                 streaming_buffer=streaming_buffer,
             )
             batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(samples=samples)
+        if cfg.diar_output_rttm_dir is not None:
+            feature_frame_length_sec = asr_model.cfg.preprocessor.window_stride
+            batch_predictions, batch_metadata = collect_diar_predictions(
+                diar_preds=multispk_asr_streamer.instance_manager.diar_states.diar_pred_out_stream,
+                samples=samples,
+                feature_lengths=streaming_buffer.streams_length,
+                feature_frame_length_sec=feature_frame_length_sec,
+                diar_frame_length_sec=feature_frame_length_sec * diar_model.output_subsampling_factor,
+            )
+            diar_predictions.extend(batch_predictions)
+            diar_samples.extend(batch_metadata)
         seglst_dict_list.extend(batch_seglst_list)
 
     else:
@@ -351,10 +479,6 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
         samples, rttms_mask_mats = get_multi_talker_samples_from_manifest(
             cfg, manifest_file=cfg.manifest_file, feat_per_sec=feat_per_sec, max_spks=cfg.max_num_of_spks
         )
-        # Note: rttms_mask_mats contains PyTorch tensors, so we pass it directly instead of storing in config
-        if cfg.spk_supervision == "rttm":
-            diar_model.add_rttms_mask_mats(rttms_mask_mats, device=asr_model.device)
-
         logging.info(f"Loaded {len(samples)} from the manifest at {cfg.manifest_file}.")
 
         streaming_buffer = CacheAwareStreamingAudioBuffer(
@@ -371,6 +495,14 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
 
             if (sample_idx + 1) % cfg.batch_size == 0 or sample_idx == len(samples) - 1:
                 logging.info(f"Starting to stream samples {sample_idx - len(streaming_buffer) + 1} to {sample_idx}...")
+                if cfg.spk_supervision == "rttm":
+                    set_batch_rttm_masks(
+                        diar_model=diar_model,
+                        rttms_mask_mats=rttms_mask_mats,
+                        batch_start=sample_idx + 1 - len(batch_samples),
+                        batch_size=len(batch_samples),
+                        device=asr_model.device,
+                    )
                 if cfg.parallel_speaker_strategy:
                     multispk_asr_streamer = launch_parallel_streaming(
                         cfg=cfg,
@@ -392,9 +524,31 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
                     batch_seglst_list = multispk_asr_streamer.generate_seglst_dicts_from_serial_streaming(
                         samples=batch_samples
                     )
+                should_collect_diar = cfg.diar_output_rttm_dir is not None or any(
+                    sample.get("rttm_filepath") for sample in batch_samples
+                )
+                if should_collect_diar:
+                    feature_frame_length_sec = asr_model.cfg.preprocessor.window_stride
+                    batch_predictions, batch_metadata = collect_diar_predictions(
+                        diar_preds=multispk_asr_streamer.instance_manager.diar_states.diar_pred_out_stream,
+                        samples=batch_samples,
+                        feature_lengths=streaming_buffer.streams_length,
+                        feature_frame_length_sec=feature_frame_length_sec,
+                        diar_frame_length_sec=feature_frame_length_sec * diar_model.output_subsampling_factor,
+                    )
+                    diar_predictions.extend(batch_predictions)
+                    diar_samples.extend(batch_metadata)
                 seglst_dict_list.extend(batch_seglst_list)
                 streaming_buffer.reset_buffer()
                 batch_samples = []
+
+    if diar_predictions:
+        write_and_score_diar_predictions(
+            predictions=diar_predictions,
+            samples=diar_samples,
+            cfg=cfg,
+            output_subsampling_factor=diar_model.output_subsampling_factor,
+        )
 
     if len(seglst_dict_list) == 0:
         logging.warning("No segmentation list dictionary found.")

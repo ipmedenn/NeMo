@@ -607,28 +607,25 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             processed_signal = self.spec_augmentation(input_spec=processed_signal, length=processed_signal_length)
         if self.streaming_mode:
             preds = self.forward_streaming(processed_signal, processed_signal_length)
+            preds_frame_factor = self.output_subsampling_factor
         else:
             emb_seq, emb_seq_length = self.frontend_encoder(
                 processed_signal=processed_signal, processed_signal_length=processed_signal_length
             )
             preds = self.forward_infer(emb_seq, emb_seq_length)
-        native_output_factor = 1 if self.high_resolution else self.encoder.subsampling_factor
-        downsample_factor = self.output_subsampling_factor // native_output_factor
-        if self.high_resolution:
-            max_output_length = min(preds.shape[1], processed_signal.shape[2])
-            output_lengths = processed_signal_length.clamp(max=max_output_length)
-            preds = preds[:, :max_output_length]
-            output_mask = self.sortformer_modules.length_to_mask(output_lengths, max_output_length)
-            preds = preds * output_mask.unsqueeze(-1)
-        elif downsample_factor > 1:
-            max_output_length = min(preds.shape[1], math.ceil(processed_signal.shape[2] / native_output_factor))
-            output_lengths = torch.div(
-                processed_signal_length + native_output_factor - 1,
-                native_output_factor,
-                rounding_mode='floor',
-            ).clamp(max=max_output_length)
-            preds = preds[:, :max_output_length]
+            preds_frame_factor = 1 if self.high_resolution else self.encoder.subsampling_factor
 
+        max_output_length = min(preds.shape[1], math.ceil(processed_signal.shape[2] / preds_frame_factor))
+        output_lengths = torch.div(
+            processed_signal_length + preds_frame_factor - 1,
+            preds_frame_factor,
+            rounding_mode='floor',
+        ).clamp(max=max_output_length)
+        preds = preds[:, :max_output_length]
+        output_mask = self.sortformer_modules.length_to_mask(output_lengths, max_output_length)
+        preds = preds * output_mask.unsqueeze(-1)
+
+        downsample_factor = self.output_subsampling_factor // preds_frame_factor
         if downsample_factor > 1:
             preds = self.sortformer_modules.downsample_preds(
                 preds,
@@ -803,11 +800,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         del processed_signal, processed_signal_length
 
-        if self.high_resolution:
-            total_preds = total_preds[:, :sig_length]
-        elif sig_length < max_n_frames:  # Discard preds corresponding to padding
-            n_frames = math.ceil(sig_length / self.encoder.subsampling_factor)
-            total_preds = total_preds[:, :n_frames, :]
+        output_frames = math.ceil(sig_length / self.output_subsampling_factor)
+        total_preds = total_preds[:, :output_frames]
         return total_preds
 
     def forward_streaming_step(
@@ -952,6 +946,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 chunk_len = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
                 start = (saved_spkcache_len + saved_fifo_len + lc_enc) * self.upsample_factor
                 chunk_preds = high_resolution_preds[:, start : start + chunk_len * self.upsample_factor]
+        native_output_factor = 1 if self.high_resolution else self.encoder.subsampling_factor
+        downsample_factor = self.output_subsampling_factor // native_output_factor
+        if downsample_factor > 1:
+            chunk_preds = self.sortformer_modules.downsample_preds(chunk_preds, downsample_factor)
         total_preds = torch.cat([total_preds, chunk_preds], dim=1)
 
         return streaming_state, total_preds

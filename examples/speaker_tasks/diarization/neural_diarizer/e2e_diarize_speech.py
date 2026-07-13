@@ -310,7 +310,9 @@ def convert_pred_mat_to_segments(
        all_uems (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
     """
     all_hypothesis, all_reference, all_uems = [], [], []
-    cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
+    if postprocessing_cfg is None and not bypass_postprocessing:
+        raise ValueError("postprocessing_cfg is required when postprocessing is enabled")
+    cfg_vad_params = OmegaConf.structured(postprocessing_cfg) if postprocessing_cfg is not None else None
     total_speaker_timestamps = predlist_to_timestamps(
         batch_preds_list=batch_preds_list,
         audio_rttm_map_dict=audio_rttm_map_dict,

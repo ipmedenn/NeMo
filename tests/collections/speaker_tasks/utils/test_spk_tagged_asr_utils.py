@@ -13,11 +13,15 @@
 # limitations under the License.
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
 from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import (
     MultitalkerTranscriptionConfig,
+    collect_diar_predictions,
+    set_batch_rttm_masks,
+    write_and_score_diar_predictions,
 )
 from omegaconf import OmegaConf
 
@@ -35,6 +39,7 @@ from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     get_word_dict_content_online,
     write_seglst,
 )
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
 from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
@@ -279,6 +284,85 @@ class TestGetDiarPredOutStream:
         assert torch.equal(new_chunk, new_stream[:, start:end])
 
 
+class TestPrepareDiarChunk:
+    @pytest.mark.unit
+    def test_feature_stacking_removes_asr_preencode_cache(self):
+        dummy = SimpleNamespace(
+            _diar_uses_feature_stacking=True,
+            asr_model=SimpleNamespace(
+                encoder=SimpleNamespace(
+                    streaming_cfg=SimpleNamespace(pre_encode_cache_size=[0, 9]),
+                )
+            ),
+        )
+        chunk_audio = torch.arange(121, dtype=torch.float32).reshape(1, 1, 121)
+
+        diar_audio, diar_lengths, diar_drop = SpeakerTaggedASR._prepare_diar_chunk(
+            dummy,
+            chunk_audio=chunk_audio,
+            chunk_lengths=torch.tensor([121]),
+            drop_extra_pre_encoded=2,
+        )
+
+        assert diar_audio.shape == (1, 1, 112)
+        assert diar_audio[0, 0, 0] == 9
+        assert torch.equal(diar_lengths, torch.tensor([112]))
+        assert diar_drop == 0
+
+    @pytest.mark.unit
+    def test_convolutional_subsampling_keeps_asr_cache_and_drop(self):
+        dummy = SimpleNamespace(_diar_uses_feature_stacking=False)
+        chunk_audio = torch.randn(1, 128, 121)
+        chunk_lengths = torch.tensor([121])
+
+        diar_audio, diar_lengths, diar_drop = SpeakerTaggedASR._prepare_diar_chunk(
+            dummy,
+            chunk_audio=chunk_audio,
+            chunk_lengths=chunk_lengths,
+            drop_extra_pre_encoded=2,
+        )
+
+        assert diar_audio is chunk_audio
+        assert diar_lengths is chunk_lengths
+        assert diar_drop == 2
+
+
+class TestParallelASRStateTimestamps:
+    @pytest.mark.unit
+    def test_decoded_length_advances_when_chunk_has_no_new_text(self):
+        asr_state = MultiTalkerInstanceManager.ASRState(max_num_of_spks=1, uppercase_first_letter=False)
+        asr_state.speakers = [0]
+        asr_state.previous_hypothesis = [
+            Hypothesis(
+                score=0.0,
+                y_sequence=[],
+                text="",
+                timestamp=torch.empty(0, dtype=torch.long),
+                dec_state=SimpleNamespace(decoded_length=torch.tensor(14)),
+                length=torch.tensor(0),
+            )
+        ]
+
+        asr_state.update_sessionwise_seglsts_for_parallel(offset=0.0)
+
+        assert asr_state._prev_decoded_lengths[0] == 14
+
+        asr_state.previous_hypothesis = [
+            Hypothesis(
+                score=0.0,
+                y_sequence=[1],
+                text="hello",
+                timestamp=torch.tensor([15]),
+                dec_state=SimpleNamespace(decoded_length=torch.tensor(28)),
+                length=torch.tensor(1),
+            )
+        ]
+        asr_state.update_sessionwise_seglsts_for_parallel(offset=1.12)
+
+        assert asr_state.seglsts[0]["start_time"] == pytest.approx(1.20)
+        assert asr_state.seglsts[0]["end_time"] == pytest.approx(1.28)
+
+
 class TestWriteSeglst:
     @pytest.mark.unit
     def test_write_and_read(self, tmp_path):
@@ -292,7 +376,83 @@ class TestWriteSeglst:
         assert content == json.dumps(seglst, indent=2) + "\n"
 
 
+class TestWriteDiarPredictionsToRttm:
+    @pytest.mark.unit
+    def test_writes_contiguous_segments_and_ignores_batch_padding(self, tmp_path):
+        diar_preds = torch.zeros(1, 6, 2)
+        diar_preds[0, 1:3, 0] = 0.9
+        diar_preds[0, 3:6, 1] = 0.8
+        output_dir = tmp_path / "rttms"
+
+        predictions, metadata = collect_diar_predictions(
+            diar_preds=diar_preds,
+            samples=[{"audio_filepath": "/audio/session.wav"}],
+            feature_lengths=torch.tensor([40]),
+            feature_frame_length_sec=0.01,
+            diar_frame_length_sec=0.08,
+        )
+        cfg = SimpleNamespace(
+            diar_output_rttm_dir=str(output_dir),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
+        )
+        write_and_score_diar_predictions(
+            predictions=predictions,
+            samples=metadata,
+            cfg=cfg,
+            output_subsampling_factor=8,
+        )
+
+        assert (output_dir / "session.rttm").read_text(encoding="utf-8").splitlines() == [
+            "SPEAKER session 1 0.080 0.160 <NA> <NA> speaker_0 <NA> <NA>",
+            "SPEAKER session 1 0.240 0.160 <NA> <NA> speaker_1 <NA> <NA>",
+        ]
+
+
 class TestGetMultiTalkerSamplesFromManifest:
+    @pytest.mark.unit
+    def test_set_batch_rttm_masks_selects_current_audio_batch(self):
+        class DummyDiarModel:
+            rttms_mask_mats = None
+
+        diar_model = DummyDiarModel()
+        all_masks = torch.arange(5 * 4 * 2).reshape(5, 4, 2)
+
+        set_batch_rttm_masks(
+            diar_model=diar_model,
+            rttms_mask_mats=all_masks,
+            batch_start=2,
+            batch_size=2,
+            device=torch.device("cpu"),
+        )
+
+        assert torch.equal(diar_model.rttms_mask_mats, all_masks[2:4])
+
+    @pytest.mark.unit
+    def test_rttm_targets_match_multitalker_asr_training_frame_alignment(self, tmp_path):
+        rttm_path = tmp_path / "sample.rttm"
+        rttm_path.write_text(
+            "SPEAKER sample 1 0.16 0.16 <NA> <NA> speaker_A <NA> <NA>\n",
+            encoding="utf-8",
+        )
+        manifest_path = tmp_path / "manifest.jsonl"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "audio_filepath": "sample.wav",
+                    "duration": 1.0,
+                    "rttm_filepath": str(rttm_path),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(spk_supervision="rttm"))
+
+        _, rttm_masks = get_multi_talker_samples_from_manifest(cfg, str(manifest_path), feat_per_sec=0.08, max_spks=2)
+
+        assert torch.equal(rttm_masks[0, :, 0], torch.tensor([0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+
     @pytest.mark.unit
     def test_missing_audio_filepath(self, tmp_path):
         mpath = tmp_path / "manifest.jsonl"

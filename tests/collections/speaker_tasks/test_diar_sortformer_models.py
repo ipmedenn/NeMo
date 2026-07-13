@@ -507,8 +507,13 @@ class TestSortformerEncLabelModelHighResolution:
 
     @pytest.mark.unit
     @pytest.mark.parametrize("async_streaming", [False, True])
-    def test_streaming_emits_fine_predictions_and_updates_cache_with_coarse_predictions(self, async_streaming):
-        model = _create_sortformer_model(high_resolution=True).eval()
+    @pytest.mark.parametrize("output_subsampling_factor", [1, 4])
+    def test_streaming_emits_configured_resolution_and_updates_cache_with_coarse_predictions(
+        self, async_streaming, output_subsampling_factor
+    ):
+        model = _create_sortformer_model(
+            high_resolution=True, output_subsampling_factor=output_subsampling_factor
+        ).eval()
         model.streaming_mode = True
         model.async_streaming = async_streaming
         processed_signal = torch.randn(1, 120, 80)
@@ -535,7 +540,8 @@ class TestSortformerEncLabelModelHighResolution:
                 total_preds,
             )
 
-        assert total_preds.shape[1] == captured["preds"].shape[1] * model.upsample_factor
+        expected_ratio = model.upsample_factor // output_subsampling_factor
+        assert total_preds.shape[1] == captured["preds"].shape[1] * expected_ratio
 
     @pytest.mark.unit
     def test_streaming_export_keeps_coarse_prediction_resolution(self):
