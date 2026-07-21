@@ -15,10 +15,12 @@
 import json
 import os
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import torch.cuda
 
+import nemo.collections.asr.data.audio_to_diar_label as audio_to_diar_label
 from nemo.collections.asr.data.audio_to_diar_label import (
     AudioToSpeechE2ESpkDiarDataset,
     get_subsegments_to_timestamps,
@@ -53,6 +55,23 @@ class TestAudioToSpeechE2ESpkDiarDataset:
 
         assert timestamps.shape == (0, 2)
         assert timestamps.dtype == torch.long
+
+    @pytest.mark.unit
+    def test_collate_stacks_audio_once(self):
+        batch = [
+            (torch.tensor([1.0, 2.0]), torch.tensor(2), torch.ones(2, 2), torch.tensor([2])),
+            (torch.tensor([3.0, 4.0, 5.0]), torch.tensor(3), torch.ones(3, 2), torch.tensor([3])),
+            (torch.tensor([6.0, 7.0, 8.0, 9.0]), torch.tensor(4), torch.ones(4, 2), torch.tensor([4])),
+        ]
+
+        with patch.object(audio_to_diar_label.torch, "stack", wraps=torch.stack) as stack:
+            audio_signal, _, _, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+
+        assert stack.call_count == 4
+        assert torch.equal(
+            audio_signal,
+            torch.tensor([[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0]]),
+        )
 
     @pytest.mark.unit
     @pytest.mark.parametrize("subsampling_factor", [1, 4])

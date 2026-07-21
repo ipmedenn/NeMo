@@ -37,6 +37,7 @@ class StreamingSortformerState:
         spkcache (torch.Tensor): Speaker cache to store embeddings from start
         spkcache_lengths (torch.Tensor): Lengths of the speaker cache
         spkcache_preds (torch.Tensor): The speaker predictions for the speaker cache parts
+        spkcache_has_been_compressed (bool): Whether speaker-cache selection has run
         fifo (torch.Tensor): FIFO queue to save the embedding from the latest chunks
         fifo_lengths (torch.Tensor): Lengths of the FIFO queue
         fifo_preds (torch.Tensor): The speaker predictions for the FIFO queue parts
@@ -48,6 +49,7 @@ class StreamingSortformerState:
     spkcache = None  # Speaker cache to store embeddings from start
     spkcache_lengths = None  #
     spkcache_preds = None  # speaker cache predictions
+    spkcache_has_been_compressed = False
     fifo = None  # to save the embedding from the latest chunks
     fifo_lengths = None
     fifo_preds = None
@@ -670,11 +672,12 @@ class SortformerModules(NeuralModule, Exportable):
 
             # append pop_out_embs to spkcache
             streaming_state.spkcache = torch.cat([streaming_state.spkcache, pop_out_embs], dim=1)
-            if streaming_state.spkcache_preds is not None:  # if speaker cache has been already updated at least once
+            if streaming_state.spkcache_has_been_compressed:
                 streaming_state.spkcache_preds = torch.cat([streaming_state.spkcache_preds, pop_out_preds], dim=1)
+            else:
+                # Before the first compression, retain fresh predictions for every current cache frame.
+                streaming_state.spkcache_preds = torch.cat([preds[:, :spkcache_len], pop_out_preds], dim=1)
             if streaming_state.spkcache.shape[1] > self.spkcache_len:
-                if streaming_state.spkcache_preds is None:  # if this is a first update of speaker cache
-                    streaming_state.spkcache_preds = torch.cat([preds[:, :spkcache_len], pop_out_preds], dim=1)
                 streaming_state.spkcache, streaming_state.spkcache_preds, streaming_state.spk_perm = (
                     self._compress_spkcache(
                         emb_seq=streaming_state.spkcache,
@@ -683,6 +686,7 @@ class SortformerModules(NeuralModule, Exportable):
                         permute_spk=self.training,
                     )
                 )
+                streaming_state.spkcache_has_been_compressed = True
 
         if self.log:
             logging.info(

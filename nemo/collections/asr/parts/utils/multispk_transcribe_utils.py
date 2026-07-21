@@ -30,7 +30,6 @@ from nemo.collections.asr.data.audio_to_diar_label import extract_frame_info_fro
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.modules.sortformer_modules import StreamingSortformerState
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
-from nemo.collections.asr.parts.utils.asr_multispeaker_utils import get_soft_mask
 from nemo.collections.asr.parts.utils.diarization_utils import get_color_palette, print_sentences, write_txt
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
@@ -137,6 +136,23 @@ def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
     logging.info(f"Saved the transcriptions of the streaming inference in\n:{output_path}")
 
 
+def get_aligned_rttm_mask(feat_level_target: torch.Tensor, num_frames: int, stride: int) -> torch.Tensor:
+    """Average non-overlapping fine-grained RTTM targets into output-frame-aligned bins."""
+    if stride < 1:
+        raise ValueError(f"stride must be positive, but received {stride}")
+
+    required_input_frames = num_frames * stride
+    if feat_level_target.shape[0] < required_input_frames:
+        padding = feat_level_target.new_zeros(
+            required_input_frames - feat_level_target.shape[0], feat_level_target.shape[1]
+        )
+        feat_level_target = torch.cat((feat_level_target, padding), dim=0)
+    else:
+        feat_level_target = feat_level_target[:required_input_frames]
+
+    return feat_level_target.reshape(num_frames, stride, feat_level_target.shape[1]).mean(dim=1)
+
+
 def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
     """
     Get the multi-talker samples from the manifest file and save it to a list named 'samples'.
@@ -182,7 +198,7 @@ def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec
                     max_spks=max_spks,
                 )
                 target_len = math.ceil(samples[-1]['duration'] / feat_per_sec)
-                rttm_mat = (get_soft_mask(fine_rttm_mat, target_len, subsampling_factor) > 0.5).float()
+                rttm_mat = (get_aligned_rttm_mask(fine_rttm_mat, target_len, subsampling_factor) > 0.5).float()
                 rttms_mask_mats.append(rttm_mat)
             samples[-1]['duration'] = None
             if 'offset' not in item:

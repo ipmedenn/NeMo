@@ -1611,6 +1611,9 @@ class TestSortformerModules_StreamingUpdate:
         expected_fifo_embs = fifo_embs_before_split[:, pop_out_len:]
         expected_fifo_preds = fifo_preds_before_split[:, pop_out_len:]
         expected_spkcache_embs = torch.cat([streaming_state.spkcache, pop_out_embs], dim=1)
+        expected_spkcache_preds = torch.cat(
+            [preds[:, :cur_spkcache_len], fifo_preds_before_split[:, :pop_out_len]], dim=1
+        )
 
         # Call streaming_update
         streaming_state, chunk_preds = sortformer_modules.streaming_update(streaming_state, chunk, preds, lc, rc)
@@ -1628,7 +1631,8 @@ class TestSortformerModules_StreamingUpdate:
         # Check updated streaming state's spkcache
         assert streaming_state.spkcache.shape == (batch_size, cur_spkcache_len + pop_out_len, emb_dim)
         assert torch.allclose(streaming_state.spkcache, expected_spkcache_embs)
-        assert streaming_state.spkcache_preds is None
+        assert torch.allclose(streaming_state.spkcache_preds, expected_spkcache_preds)
+        assert not streaming_state.spkcache_has_been_compressed
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -1712,6 +1716,7 @@ class TestSortformerModules_StreamingUpdate:
         # Check updated streaming state's spkcache
         assert streaming_state.spkcache.shape == (batch_size, spkcache_len, emb_dim)
         assert streaming_state.spkcache_preds.shape == (batch_size, spkcache_len, n_spk)
+        assert streaming_state.spkcache_has_been_compressed
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

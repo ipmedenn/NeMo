@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, is_dataclass
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
@@ -92,6 +93,7 @@ class DiarizationConfig:
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
     log: bool = False  # If True, log will be printed
     output_subsampling_factor: Optional[int] = None  # Override prediction step in 10 ms feature frames
+    profile_inference: bool = True  # Report CUDA-synchronized preprocessor and main inference wall times
 
     use_lhotse: bool = True
     batch_duration: int = 100000
@@ -108,6 +110,7 @@ class DiarizationConfig:
     chunk_len: int = 6
     chunk_left_context: int = 1
     chunk_right_context: int = 7
+    strong_boost_rate: Optional[float] = None  # Override the model's speaker-cache strong boosting rate
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -120,6 +123,63 @@ class DiarizationConfig:
     optuna_storage: str = f"sqlite:///{optuna_study_name}.db"
     optuna_log_file: str = f"{optuna_study_name}.log"
     optuna_n_trials: int = 100000
+
+
+class InferenceProfiler:
+    """Measure preprocessor and main inference wall times without including evaluation."""
+
+    def __init__(self, model: SortformerEncLabelModel):
+        self.model = model
+        self.forward_time = 0.0
+        self.preprocessor_time = 0.0
+        self.forward_calls = 0
+        self.preprocessor_calls = 0
+
+    def _synchronize(self):
+        if self.model.device.type == 'cuda':
+            torch.cuda.synchronize(self.model.device)
+
+    def install(self):
+        original_process_signal = self.model.process_signal
+        original_forward = self.model.forward
+
+        def timed_process_signal(*args, **kwargs):
+            self._synchronize()
+            start = time.perf_counter()
+            try:
+                return original_process_signal(*args, **kwargs)
+            finally:
+                self._synchronize()
+                self.preprocessor_time += time.perf_counter() - start
+                self.preprocessor_calls += 1
+
+        def timed_forward(*args, **kwargs):
+            self._synchronize()
+            start = time.perf_counter()
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                self._synchronize()
+                self.forward_time += time.perf_counter() - start
+                self.forward_calls += 1
+
+        self.model.process_signal = timed_process_signal
+        self.model.forward = timed_forward
+
+    def log_summary(self, audio_duration: float):
+        main_inference_time = max(0.0, self.forward_time - self.preprocessor_time)
+        preprocessor_percent = 100 * self.preprocessor_time / self.forward_time
+        main_inference_percent = 100 * main_inference_time / self.forward_time
+        logging.info(
+            "Inference profile: "
+            f"audio={audio_duration:.2f}s, model_forward={self.forward_time:.3f}s "
+            f"(RTF={self.forward_time / audio_duration:.6f}, {audio_duration / self.forward_time:.2f}x realtime), "
+            f"preprocessor={self.preprocessor_time:.3f}s ({preprocessor_percent:.2f}%, "
+            f"RTF={self.preprocessor_time / audio_duration:.6f}), "
+            f"main_inference={main_inference_time:.3f}s ({main_inference_percent:.2f}%, "
+            f"RTF={main_inference_time / audio_duration:.6f}), "
+            f"calls={self.forward_calls}"
+        )
 
 
 def configure_output_subsampling_factor(
@@ -428,6 +488,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.sortformer_modules.fifo_len = cfg.fifo_len
         diar_model.sortformer_modules.log = cfg.log
         diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
+        if cfg.strong_boost_rate is not None:
+            diar_model.sortformer_modules.strong_boost_rate = cfg.strong_boost_rate
         diar_model.sortformer_modules._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
@@ -435,6 +497,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
+    inference_profiler = InferenceProfiler(diar_model) if cfg.profile_inference else None
+    if inference_profiler is not None:
+        inference_profiler.install()
 
     if os.path.exists(tensor_path) and cfg.save_preds_tensors:
         logging.info(
@@ -447,6 +512,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             diar_model.test_batch()
 
         diar_model_preds_total_list = diar_model.preds_total_list
+        if inference_profiler is not None:
+            audio_duration = sum(float(item['duration']) for item in infer_audio_rttm_dict.values())
+            inference_profiler.log_summary(audio_duration)
         if cfg.save_preds_tensors:
             torch.save(diar_model.preds_total_list, tensor_path)
 

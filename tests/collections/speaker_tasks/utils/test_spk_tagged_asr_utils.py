@@ -429,7 +429,7 @@ class TestGetMultiTalkerSamplesFromManifest:
         assert torch.equal(diar_model.rttms_mask_mats, all_masks[2:4])
 
     @pytest.mark.unit
-    def test_rttm_targets_match_multitalker_asr_training_frame_alignment(self, tmp_path):
+    def test_rttm_targets_align_with_nonoverlapping_output_frames(self, tmp_path):
         rttm_path = tmp_path / "sample.rttm"
         rttm_path.write_text(
             "SPEAKER sample 1 0.16 0.16 <NA> <NA> speaker_A <NA> <NA>\n",
@@ -451,7 +451,7 @@ class TestGetMultiTalkerSamplesFromManifest:
 
         _, rttm_masks = get_multi_talker_samples_from_manifest(cfg, str(manifest_path), feat_per_sec=0.08, max_spks=2)
 
-        assert torch.equal(rttm_masks[0, :, 0], torch.tensor([0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]))
+        assert torch.equal(rttm_masks[0, :, 0], torch.tensor([0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
 
     @pytest.mark.unit
     def test_missing_audio_filepath(self, tmp_path):

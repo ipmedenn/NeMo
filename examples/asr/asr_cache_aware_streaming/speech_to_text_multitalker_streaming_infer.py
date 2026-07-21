@@ -68,7 +68,7 @@ class MultitalkerTranscriptionConfig:
     # Streaming diarization configs
     streaming_mode: bool = True  # If True, streaming diarization will be used.
     spkcache_len: int = 188
-    spkcache_update_period: int = 222
+    spkcache_update_period: int = 144
     spkcache_refresh_rate: int = 0
     fifo_len: int = 188
     chunk_len: int = 0
