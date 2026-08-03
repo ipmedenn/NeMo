@@ -476,17 +476,28 @@ class TestScoreLabelsFromRttmLabels:
         """``metric.report()`` returns a non-empty string."""
         metric, _, _ = _score(
             [(0, 5, "A"), (5, 10, "B")],
-            [(0, 5, "A"), (5, 10, "B")],
+            [(0, 4, "A"), (4, 8, "B"), (10, 12, "C")],
         )
         report = metric.report()
         assert isinstance(report, str)
         assert len(report) > 0
         assert "file1" in report
-        assert "confusion %" in report
-        assert "false alarm %" in report
-        assert "missed %" in report
         expected_total_column = len("file1") + 1 + 10 - len("total")
         assert report.splitlines()[0].index("total") == expected_total_column
+        header = report.splitlines()[0]
+        assert header.count("%") == 3
+        assert header.index("false alarm") < header.index("missed") < header.index("confusion") < header.index("DER")
+        assert report.splitlines()[2].split() == [
+            "file1",
+            "10.00",
+            "2.00",
+            "20.00%",
+            "2.00",
+            "20.00%",
+            "1.00",
+            "10.00%",
+            "50.00%",
+        ]
 
     @pytest.mark.unit
     def test_results_list(self):

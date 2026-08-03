@@ -597,7 +597,7 @@ def score_labels(
         if ref_n_spk == hyp_n_spk:
             correct_spk_count += 1
         if verbose and ref_n_spk != hyp_n_spk:
-            logging.info(f"Wrong Spk. Count with uniq_id:...{ref_key[-10:]}, " f"Ref: {ref_n_spk}, Hyp: {hyp_n_spk}")
+            logging.info(f"Wrong Spk. Count with uniq_id: {ref_key}, Ref: {ref_n_spk}, Hyp: {hyp_n_spk}")
 
         ref_dicts.append(_annotation_to_rttm_data(ref_key, ref_labels))
         sys_dicts.append(_annotation_to_rttm_data(ref_key, hyp_labels))
