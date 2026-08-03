@@ -20,6 +20,9 @@ import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
     configure_output_subsampling_factor,
+    get_tensor_path,
+    load_prediction_tensors,
+    save_prediction_tensors,
 )
 from omegaconf import DictConfig
 
@@ -377,6 +380,72 @@ class TestSortformerEncLabelModelHighResolution:
 
         with pytest.raises(ValueError, match="output_subsampling_factor must be a positive integer"):
             configure_output_subsampling_factor(model, 0)
+
+    @pytest.mark.unit
+    def test_explicit_prediction_tensor_path_avoids_automatic_directory(self, tmp_path):
+        explicit_path = tmp_path / "custom" / "predictions.pt"
+        cfg = SimpleNamespace(
+            model_path=str(tmp_path / "model.nemo"),
+            dataset_manifest=str(tmp_path / "sample.json"),
+            output_subsampling_factor=8,
+            out_preds_tensors=str(explicit_path),
+        )
+
+        tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
+
+        assert tensor_path == str(explicit_path.absolute())
+        assert model_id == "model_sf8"
+        assert tensor_filename == "sample"
+        assert not (tmp_path / "pred_tensors").exists()
+
+    @pytest.mark.unit
+    def test_prediction_tensor_cache_is_disabled_without_explicit_path(self, tmp_path):
+        cfg = SimpleNamespace(
+            model_path=str(tmp_path / "model.nemo"),
+            dataset_manifest=str(tmp_path / "sample.json"),
+            output_subsampling_factor=8,
+            out_preds_tensors=None,
+        )
+
+        tensor_path, _, _ = get_tensor_path(cfg)
+
+        assert tensor_path is None
+        assert not (tmp_path / "pred_tensors").exists()
+
+    @pytest.mark.unit
+    def test_prediction_tensor_cache_round_trip_and_atomic_overwrite(self, tmp_path):
+        tensor_path = tmp_path / "cache" / "predictions.pt"
+        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
+        first_predictions = [torch.ones(1, 4, 2)]
+        second_predictions = [torch.zeros(1, 5, 2)]
+
+        save_prediction_tensors(str(tensor_path), first_predictions, metadata)
+        assert torch.equal(load_prediction_tensors(str(tensor_path), metadata)[0], first_predictions[0])
+
+        save_prediction_tensors(str(tensor_path), second_predictions, metadata)
+        assert torch.equal(load_prediction_tensors(str(tensor_path), metadata)[0], second_predictions[0])
+        assert list(tensor_path.parent.glob(f".{tensor_path.name}.*.tmp")) == []
+
+    @pytest.mark.unit
+    def test_prediction_tensor_cache_rejects_metadata_mismatch(self, tmp_path):
+        tensor_path = tmp_path / "predictions.pt"
+        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
+        save_prediction_tensors(str(tensor_path), [torch.ones(1, 4, 2)], metadata)
+
+        incompatible_metadata = {**metadata, "recording_ids": ["different-session"]}
+        with pytest.raises(ValueError, match="recording_ids"):
+            load_prediction_tensors(str(tensor_path), incompatible_metadata)
+
+    @pytest.mark.unit
+    def test_legacy_prediction_tensor_cache_is_supported(self, tmp_path):
+        tensor_path = tmp_path / "legacy.pt"
+        predictions = [torch.ones(1, 4, 2)]
+        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
+        torch.save(predictions, tensor_path)
+
+        loaded_predictions = load_prediction_tensors(str(tensor_path), metadata)
+
+        assert torch.equal(loaded_predictions[0], predictions[0])
 
     @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [0, -1, 1.5, True])

@@ -42,6 +42,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, is_dataclass
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
 
@@ -82,8 +83,9 @@ class DiarizationConfig:
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
-    save_preds_tensors: bool = False
-    precision: str = "32"  # 32, bf16, bf16-mixed
+    out_preds_tensors: Optional[str] = None  # Explicit cache path; enables prediction loading and saving
+    overwrite_preds_tensors: bool = False  # Ignore and replace an existing prediction cache
+    precision: str = "bf16"  # 32, bf16, bf16-mixed
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
@@ -110,7 +112,6 @@ class DiarizationConfig:
     chunk_len: int = 6
     chunk_left_context: int = 1
     chunk_right_context: int = 7
-    strong_boost_rate: Optional[float] = None  # Override the model's speaker-cache strong boosting rate
 
     # If `cuda` is a negative number, inference will be on CPU only.
     cuda: Optional[int] = None
@@ -226,25 +227,114 @@ def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial) -> Po
     return postprocessing_cfg
 
 
-def get_tensor_path(cfg: DiarizationConfig) -> str:
+def get_tensor_path(cfg: DiarizationConfig) -> tuple[Optional[str], str, str]:
     """
-    Constructs the file path for saving or loading prediction tensors based on the configuration.
+    Resolve the explicit prediction-cache path and derive model/manifest identifiers.
 
     Args:
         cfg (DiarizationConfig): The configuration object containing model and dataset details.
 
     Returns:
-        str: The constructed file path for the prediction tensor.
+        Tuple containing the optional cache path, model identifier, and manifest identifier.
     """
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
-    model_base_path = os.path.dirname(cfg.model_path)
-    model_id = os.path.basename(cfg.model_path).replace(".ckpt", "").replace(".nemo", "")
+    model_path = Path(cfg.model_path).expanduser().absolute()
+    model_id = model_path.name.replace(".ckpt", "").replace(".nemo", "")
     model_id = f"{model_id}_sf{cfg.output_subsampling_factor}"
-    bpath = f"{model_base_path}/pred_tensors"
-    if not os.path.exists(bpath):
-        os.makedirs(bpath)
-    tensor_path = f"{bpath}/__{model_id}__{tensor_filename}.pt"
-    return tensor_path, model_id, tensor_filename
+    if cfg.out_preds_tensors:
+        tensor_path = Path(cfg.out_preds_tensors).expanduser().absolute()
+    else:
+        tensor_path = None
+    return None if tensor_path is None else str(tensor_path), model_id, tensor_filename
+
+
+def get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) -> Dict:
+    """Describe inputs and inference settings that affect cached prediction tensors."""
+    model_path = Path(cfg.model_path).expanduser().resolve()
+    manifest_path = Path(cfg.dataset_manifest).expanduser().resolve()
+    model_stat = model_path.stat()
+    manifest_stat = manifest_path.stat()
+    modules = diar_model.sortformer_modules
+    return {
+        "version": 1,
+        "model_path": str(model_path),
+        "model_size": model_stat.st_size,
+        "model_mtime_ns": model_stat.st_mtime_ns,
+        "manifest_path": str(manifest_path),
+        "manifest_size": manifest_stat.st_size,
+        "manifest_mtime_ns": manifest_stat.st_mtime_ns,
+        "recording_ids": list(infer_audio_rttm_dict),
+        "num_speakers": int(diar_model._cfg.max_num_of_spks),
+        "output_subsampling_factor": int(cfg.output_subsampling_factor),
+        "precision": str(cfg.precision),
+        "presort_manifest": bool(cfg.presort_manifest),
+        "streaming_mode": bool(diar_model.streaming_mode),
+        "async_streaming": bool(cfg.async_streaming),
+        "chunk_len": int(cfg.chunk_len),
+        "chunk_left_context": int(cfg.chunk_left_context),
+        "chunk_right_context": int(cfg.chunk_right_context),
+        "spkcache_len": int(cfg.spkcache_len),
+        "spkcache_update_period": int(cfg.spkcache_update_period),
+        "fifo_len": int(cfg.fifo_len),
+        "strong_boost_rate": float(modules.strong_boost_rate),
+        "weak_boost_rate": float(modules.weak_boost_rate),
+        "scores_boost_latest": float(modules.scores_boost_latest),
+    }
+
+
+def validate_prediction_tensors(predictions, metadata: Dict) -> List[torch.Tensor]:
+    """Validate cached prediction count and tensor dimensions."""
+    if not isinstance(predictions, (list, tuple)):
+        raise ValueError(f"Prediction cache must contain a list of tensors, got {type(predictions).__name__}")
+    if len(predictions) != len(metadata["recording_ids"]):
+        raise ValueError(
+            f"Prediction cache contains {len(predictions)} recordings, "
+            f"but the manifest contains {len(metadata['recording_ids'])}"
+        )
+    num_speakers = metadata["num_speakers"]
+    for index, prediction in enumerate(predictions):
+        if not isinstance(prediction, torch.Tensor) or prediction.ndim != 3 or prediction.shape[0] != 1:
+            raise ValueError(f"Prediction {index} must have shape (1, frames, speakers)")
+        if prediction.shape[-1] != num_speakers:
+            raise ValueError(
+                f"Prediction {index} has {prediction.shape[-1]} speakers, but the model expects {num_speakers}"
+            )
+    return list(predictions)
+
+
+def load_prediction_tensors(tensor_path: str, expected_metadata: Dict) -> List[torch.Tensor]:
+    """Load prediction tensors and reject caches created with incompatible settings."""
+    payload = torch.load(tensor_path, weights_only=True)
+    if isinstance(payload, (list, tuple)):
+        logging.warning("Loading a legacy prediction cache without metadata validation.")
+        return validate_prediction_tensors(payload, expected_metadata)
+    if not isinstance(payload, dict) or "metadata" not in payload or "predictions" not in payload:
+        raise ValueError("Prediction cache must contain 'metadata' and 'predictions'")
+
+    cached_metadata = payload["metadata"]
+    mismatched_keys = [
+        key for key, expected_value in expected_metadata.items() if cached_metadata.get(key) != expected_value
+    ]
+    if mismatched_keys:
+        mismatch_list = ", ".join(mismatched_keys)
+        raise ValueError(
+            f"Prediction cache metadata does not match the current inference settings: {mismatch_list}. "
+            "Use overwrite_preds_tensors=True or choose a different out_preds_tensors path."
+        )
+    return validate_prediction_tensors(payload["predictions"], expected_metadata)
+
+
+def save_prediction_tensors(tensor_path: str, predictions: List[torch.Tensor], metadata: Dict) -> None:
+    """Atomically save prediction tensors and their cache-compatibility metadata."""
+    path = Path(tensor_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as tmp:
+        temporary_path = Path(tmp.name)
+    try:
+        torch.save({"metadata": metadata, "predictions": predictions}, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def diarization_objective(
@@ -488,8 +578,6 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.sortformer_modules.fifo_len = cfg.fifo_len
         diar_model.sortformer_modules.log = cfg.log
         diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
-        if cfg.strong_boost_rate is not None:
-            diar_model.sortformer_modules.strong_boost_rate = cfg.strong_boost_rate
         diar_model.sortformer_modules._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
@@ -501,11 +589,15 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if inference_profiler is not None:
         inference_profiler.install()
 
-    if os.path.exists(tensor_path) and cfg.save_preds_tensors:
+    prediction_cache_metadata = (
+        get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) if tensor_path is not None else None
+    )
+
+    if tensor_path is not None and os.path.exists(tensor_path) and not cfg.overwrite_preds_tensors:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
         )
-        diar_model_preds_total_list = torch.load(tensor_path)
+        diar_model_preds_total_list = load_prediction_tensors(tensor_path, prediction_cache_metadata)
     else:
         logging.info("No saved prediction tensors found. Running inference on the dataset...")
         with torch.inference_mode(), torch.autocast(device_type=diar_model.device.type, dtype=diar_model.dtype):
@@ -515,8 +607,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         if inference_profiler is not None:
             audio_duration = sum(float(item['duration']) for item in infer_audio_rttm_dict.values())
             inference_profiler.log_summary(audio_duration)
-        if cfg.save_preds_tensors:
-            torch.save(diar_model.preds_total_list, tensor_path)
+        if tensor_path is not None:
+            save_prediction_tensors(tensor_path, diar_model.preds_total_list, prediction_cache_metadata)
+            logging.info(f"Prediction tensors saved to {tensor_path}")
 
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
