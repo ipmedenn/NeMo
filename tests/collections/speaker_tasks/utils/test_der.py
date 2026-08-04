@@ -482,10 +482,10 @@ class TestScoreLabelsFromRttmLabels:
         assert isinstance(report, str)
         assert len(report) > 0
         assert "file1" in report
-        expected_total_column = len("file1") + 1 + 10 - len("total")
+        expected_total_column = len("file1") + 1 + 11 - len("total")
         assert report.splitlines()[0].index("total") == expected_total_column
         header = report.splitlines()[0]
-        assert header.count("%") == 3
+        assert header.count("%") == 4
         assert header.index("false alarm") < header.index("missed") < header.index("confusion") < header.index("DER")
         assert report.splitlines()[2].split() == [
             "file1",

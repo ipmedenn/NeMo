@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def read_rttm(path: Path, empty_recording_id: str | None = None) -> LabelsByRecording:
+def read_rttm(path: Path, empty_recording_id: str | None = None, allow_empty: bool = False) -> LabelsByRecording:
     """Read an RTTM into NeMo ``start end speaker`` labels grouped by recording ID."""
     if not path.is_file():
         raise FileNotFoundError(f"RTTM file not found: {path}")
@@ -88,6 +88,8 @@ def read_rttm(path: Path, empty_recording_id: str | None = None) -> LabelsByReco
     if not labels:
         if empty_recording_id is not None:
             return {empty_recording_id: []}
+        if allow_empty:
+            return {}
         raise ValueError(f"No SPEAKER records found in {path}")
     return dict(labels)
 
@@ -118,10 +120,10 @@ def read_rttm_directory(directory: Path) -> LabelsByRecording:
     return recordings
 
 
-def read_rttm_source(path: Path) -> LabelsByRecording:
+def read_rttm_source(path: Path, allow_empty: bool = False) -> LabelsByRecording:
     """Read a compound RTTM file or a directory of per-recording RTTMs."""
     if path.is_file():
-        return read_rttm(path)
+        return read_rttm(path, allow_empty=allow_empty)
     if path.is_dir():
         return read_rttm_directory(path)
     raise FileNotFoundError(f"RTTM path not found: {path}")
@@ -182,7 +184,11 @@ def read_rttm_manifest(manifest_path: Path) -> Tuple[LabelsByRecording, Dict[str
 def read_rttm_inputs(reference_path: Path, hypothesis_path: Path) -> Tuple[LabelsByRecording, LabelsByRecording]:
     """Read any file/directory RTTM pairing, requiring exact filenames when both are directories."""
     if reference_path.is_file() and hypothesis_path.is_file():
-        return read_rttm(reference_path), read_rttm(hypothesis_path)
+        reference = read_rttm(reference_path)
+        hypothesis = read_rttm(hypothesis_path, allow_empty=True)
+        if not hypothesis:
+            hypothesis = {recording_id: [] for recording_id in reference}
+        return reference, hypothesis
 
     if reference_path.is_dir() and hypothesis_path.is_dir():
         reference_files = get_rttm_files(reference_path)
@@ -219,36 +225,31 @@ def read_rttm_inputs(reference_path: Path, hypothesis_path: Path) -> Tuple[Label
         raise FileNotFoundError(f"Reference path not found: {reference_path}")
     if not hypothesis_path.exists():
         raise FileNotFoundError(f"Hypothesis path not found: {hypothesis_path}")
-    return read_rttm_source(reference_path), read_rttm_source(hypothesis_path)
+    reference = read_rttm_source(reference_path)
+    hypothesis = read_rttm_source(hypothesis_path, allow_empty=True)
+    if not hypothesis:
+        hypothesis = {recording_id: [] for recording_id in reference}
+    return reference, hypothesis
 
 
 def align_recording_ids(
     reference: LabelsByRecording, hypothesis: LabelsByRecording
 ) -> Tuple[LabelsByRecording, str | None]:
-    """Align recording IDs, accounting for Sortformer's trailing ``_mixed`` suffix."""
+    """Align recording IDs, filling missing hypotheses while rejecting extra IDs."""
     ref_ids = set(reference)
-    hyp_ids = set(hypothesis)
-    if ref_ids == hyp_ids:
-        return hypothesis, None
-
-    normalized: LabelsByRecording = {}
-    for recording_id, labels in hypothesis.items():
-        normalized_id = recording_id.removesuffix("_mixed")
-        if normalized_id in normalized:
-            raise ValueError(f"Hypothesis recording IDs collide after normalization: {normalized_id}")
-        normalized[normalized_id] = labels
-
-    if ref_ids == set(normalized):
-        return normalized, "Removed trailing '_mixed' from hypothesis recording IDs."
-
-    missing = sorted(ref_ids - hyp_ids)
-    extra = sorted(hyp_ids - ref_ids)
-    details = []
-    if missing:
-        details.append(f"missing in hypothesis: {', '.join(missing[:5])}")
+    extra = sorted(set(hypothesis) - ref_ids)
     if extra:
-        details.append(f"not in reference: {', '.join(extra[:5])}")
-    raise ValueError("Reference and hypothesis recording IDs do not match (" + "; ".join(details) + ")")
+        raise ValueError(f"Hypothesis contains recording IDs not in reference: {', '.join(extra[:5])}")
+
+    aligned = dict(hypothesis)
+    missing = sorted(ref_ids - set(hypothesis))
+    if missing:
+        for recording_id in missing:
+            aligned[recording_id] = []
+
+    aligned = {recording_id: aligned[recording_id] for recording_id in reference}
+    message = f"Treating missing hypothesis recording IDs as empty: {', '.join(missing[:5])}." if missing else None
+    return aligned, message
 
 
 def main() -> None:
@@ -264,11 +265,13 @@ def main() -> None:
         if hypothesis_is_manifest:
             hypothesis, _ = read_rttm_manifest(args.hypothesis)
         else:
-            hypothesis = read_rttm_source(args.hypothesis)
+            hypothesis = read_rttm_source(args.hypothesis, allow_empty=True)
+            if not hypothesis:
+                hypothesis = {recording_id: [] for recording_id in reference}
     else:
         reference, hypothesis = read_rttm_inputs(args.reference, args.hypothesis)
         audio_rttm_map = {recording_id: {} for recording_id in reference}
-    hypothesis, normalization_message = align_recording_ids(reference, hypothesis)
+    hypothesis, alignment_message = align_recording_ids(reference, hypothesis)
     recording_ids = sorted(reference)
 
     all_reference = []
@@ -277,8 +280,8 @@ def main() -> None:
         all_reference.append([recording_id, labels_to_supervisions(reference[recording_id], uniq_name=recording_id)])
         all_hypothesis.append([recording_id, labels_to_supervisions(hypothesis[recording_id], uniq_name=recording_id)])
 
-    if normalization_message:
-        print(normalization_message, flush=True)
+    if alignment_message:
+        print(alignment_message, flush=True)
     print(f"Recordings: {len(recording_ids)}", flush=True)
     print(f"Collar: {args.collar:g} sec; ignore_overlap: False", flush=True)
 
