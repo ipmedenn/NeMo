@@ -133,9 +133,8 @@ def get_frame_targets_from_rttm(
         feat_per_sec (int):
             Number of feature frames per second.
             This quantity is determined by window_stride variable in preprocessing module.
-        target_spks (tuple):
-            Speaker indices that are generated from combinations. If there are only one or two speakers,
-            only a single target_spks variable is generated.
+        max_spks (int):
+            Maximum number of target speakers. Use -1 to preserve all speakers.
 
     Returns:
         feat_level_target (torch.tensor):
@@ -144,18 +143,22 @@ def get_frame_targets_from_rttm(
     stt_list, end_list, speaker_list = rttm_timestamps
     sorted_speakers = sorted(list(set(speaker_list)))
     total_fr_len = int(duration * feat_per_sec)
-    if len(sorted_speakers) > max_spks:
+    if max_spks == -1:
+        num_target_speakers = max(1, len(sorted_speakers))
+    else:
+        num_target_speakers = max_spks
+    if max_spks != -1 and len(sorted_speakers) > max_spks:
         logging.warning(
             f"Number of speakers in RTTM file {len(sorted_speakers)} exceeds the maximum number of speakers: "
             f"{max_spks}! Only {max_spks} first speakers remain, and this will affect frame metrics!"
         )
-    feat_level_target = torch.zeros(total_fr_len, max_spks)
+    feat_level_target = torch.zeros(total_fr_len, num_target_speakers)
     for count, (stt, end, spk_rttm_key) in enumerate(zip(stt_list, end_list, speaker_list)):
         if end < offset or stt > offset + duration:
             continue
         stt, end = max(offset, stt), min(offset + duration, end)
         spk = spk_rttm_key
-        if spk < max_spks:
+        if spk < num_target_speakers:
             stt_fr, end_fr = int((stt - offset) * feat_per_sec), int((end - offset) * feat_per_sec)
             feat_level_target[stt_fr:end_fr, spk] = 1
     return feat_level_target
@@ -300,7 +303,8 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         """
         if rttm_file in [None, '']:
             num_seg = torch.max(target_len)
-            targets = torch.zeros(num_seg, self.max_spks)
+            num_target_speakers = 1 if self.max_spks == -1 else self.max_spks
+            targets = torch.zeros(num_seg, num_target_speakers)
             return targets
 
         with open(rttm_file, 'r') as f:
@@ -345,7 +349,7 @@ class _AudioToSpeechE2ESpkDiarDataset(Dataset):
         if stride <= 1:
             return feat_level_target[:num_seg, :].clone()
 
-        targets = torch.zeros(num_seg, self.max_spks)
+        targets = feat_level_target.new_zeros((num_seg, feat_level_target.shape[1]))
         for index in range(num_seg):
             if index == 0:
                 seg_stt_feat = 0
@@ -464,6 +468,7 @@ def _eesd_train_collate_fn(self, batch):
 
     max_raw_feat_len = max([x.shape[0] for x in audio_signal])
     max_target_len = max([x.shape[0] for x in targets])
+    max_target_speakers = max([x.shape[1] for x in targets])
     if max([len(feat.shape) for feat in audio_signal]) > 1:
         max_ch = max([feat.shape[1] for feat in audio_signal])
     else:
@@ -477,7 +482,7 @@ def _eesd_train_collate_fn(self, batch):
         if feat.shape[0] < feat_len:
             feat_len_pad = feat_len - feat.shape[0]
             feat = torch.nn.functional.pad(feat, (0, feat_len_pad))
-        pad_tgt = (0, 0, 0, max_target_len - seq_len)
+        pad_tgt = (0, max_target_speakers - tgt.shape[1], 0, max_target_len - seq_len)
         padded_feat = torch.nn.functional.pad(feat, pad_feat)
         padded_tgt = torch.nn.functional.pad(tgt, pad_tgt)
         if max_ch > 1 and padded_feat.shape[1] < max_ch:

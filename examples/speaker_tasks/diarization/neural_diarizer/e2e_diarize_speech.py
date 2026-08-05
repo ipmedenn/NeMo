@@ -556,6 +556,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     diar_model._cfg.test_ds.pin_memory = False
+    diar_model._cfg.test_ds.num_spks = -1
 
     OmegaConf.set_struct(diar_model._cfg, False)
     diar_model._cfg.test_ds.use_lhotse = cfg.use_lhotse

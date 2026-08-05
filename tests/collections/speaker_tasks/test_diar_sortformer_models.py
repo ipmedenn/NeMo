@@ -487,6 +487,26 @@ class TestSortformerEncLabelModelHighResolution:
         assert torch.isfinite(metrics["val_loss"])
 
     @pytest.mark.unit
+    def test_test_metrics_count_speakers_beyond_model_capacity_as_false_negatives(self):
+        model = _create_sortformer_model().eval()
+        targets = torch.eye(5).unsqueeze(0)
+        preds = targets[:, :, :4]
+        model.batch_f1_accs_list = []
+        model.batch_precision_list = []
+        model.batch_recall_list = []
+        model.batch_f1_accs_ats_list = []
+
+        model._get_aux_test_batch_evaluations(
+            batch_idx=0,
+            preds=preds,
+            targets=targets,
+            target_lens=torch.tensor([5]),
+        )
+
+        assert model.batch_precision_list[0].item() == pytest.approx(1.0)
+        assert model.batch_recall_list[0].item() == pytest.approx(0.8)
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [1, 3, 16])
     def test_legacy_dataloader_uses_high_resolution_targets(self, output_subsampling_factor):
         model = _create_sortformer_model(

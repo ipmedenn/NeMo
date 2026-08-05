@@ -1180,16 +1180,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size,)
         """
         preds, targets, target_lens = self._align_predictions_and_targets(preds, targets, target_lens)
-        targets_ats, _ = get_ats_targets_hungarian(targets, preds, tolerance=self.ats_tolerance)
-        targets_pil, _ = get_pil_targets_hungarian(targets, preds)
-        self._accuracy_test(preds, targets_pil, target_lens)
+        if targets.shape[2] > preds.shape[2]:
+            metric_preds = torch.nn.functional.pad(preds, (0, targets.shape[2] - preds.shape[2]))
+        else:
+            metric_preds = preds
+        targets_ats, _ = get_ats_targets_hungarian(targets, metric_preds, tolerance=self.ats_tolerance)
+        targets_pil, _ = get_pil_targets_hungarian(targets, metric_preds)
+        self._accuracy_test(metric_preds, targets_pil, target_lens)
         f1_acc, precision, recall = self._accuracy_test.compute()
         self.batch_f1_accs_list.append(f1_acc)
         self.batch_precision_list.append(precision)
         self.batch_recall_list.append(recall)
         logging.info(f"batch {batch_idx}: f1_acc={f1_acc}, precision={precision}, recall={recall}")
 
-        self._accuracy_test_ats(preds, targets_ats, target_lens)
+        self._accuracy_test_ats(metric_preds, targets_ats, target_lens)
         f1_acc_ats, precision_ats, recall_ats = self._accuracy_test_ats.compute()
         self.batch_f1_accs_ats_list.append(f1_acc_ats)
         logging.info(

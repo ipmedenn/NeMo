@@ -23,6 +23,7 @@ import torch.cuda
 import nemo.collections.asr.data.audio_to_diar_label as audio_to_diar_label
 from nemo.collections.asr.data.audio_to_diar_label import (
     AudioToSpeechE2ESpkDiarDataset,
+    get_frame_targets_from_rttm,
     get_subsegments_to_timestamps,
 )
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
@@ -72,6 +73,28 @@ class TestAudioToSpeechE2ESpkDiarDataset:
             audio_signal,
             torch.tensor([[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0]]),
         )
+
+    @pytest.mark.unit
+    def test_unlimited_speaker_targets_and_collation(self):
+        frame_targets = get_frame_targets_from_rttm(
+            rttm_timestamps=([0.0, 0.2, 0.4], [0.2, 0.4, 0.6], [0, 1, 2]),
+            offset=0.0,
+            duration=1.0,
+            round_digits=2,
+            feat_per_sec=10,
+            max_spks=-1,
+        )
+        assert frame_targets.shape == (10, 3)
+        assert torch.equal(frame_targets.sum(dim=0), torch.tensor([2.0, 2.0, 2.0]))
+
+        batch = [
+            (torch.ones(4), torch.tensor(4), torch.ones(2, 2), torch.tensor([2])),
+            (torch.ones(6), torch.tensor(6), torch.ones(3, 3), torch.tensor([3])),
+        ]
+        _, _, targets, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+
+        assert targets.shape == (2, 3, 3)
+        assert torch.count_nonzero(targets[0, :, 2]) == 0
 
     @pytest.mark.unit
     @pytest.mark.parametrize("subsampling_factor", [1, 4])
