@@ -20,9 +20,9 @@ from unittest.mock import patch
 import pytest
 import torch.cuda
 
-import nemo.collections.asr.data.audio_to_diar_label as audio_to_diar_label
 from nemo.collections.asr.data.audio_to_diar_label import (
     AudioToSpeechE2ESpkDiarDataset,
+    _eesd_train_collate_fn,
     get_frame_targets_from_rttm,
     get_subsegments_to_timestamps,
 )
@@ -65,8 +65,8 @@ class TestAudioToSpeechE2ESpkDiarDataset:
             (torch.tensor([6.0, 7.0, 8.0, 9.0]), torch.tensor(4), torch.ones(4, 2), torch.tensor([4])),
         ]
 
-        with patch.object(audio_to_diar_label.torch, "stack", wraps=torch.stack) as stack:
-            audio_signal, _, _, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+        with patch.object(torch, "stack", wraps=torch.stack) as stack:
+            audio_signal, _, _, _ = _eesd_train_collate_fn(None, batch)
 
         assert stack.call_count == 4
         assert torch.equal(
@@ -91,7 +91,7 @@ class TestAudioToSpeechE2ESpkDiarDataset:
             (torch.ones(4), torch.tensor(4), torch.ones(2, 2), torch.tensor([2])),
             (torch.ones(6), torch.tensor(6), torch.ones(3, 3), torch.tensor([3])),
         ]
-        _, _, targets, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+        _, _, targets, _ = _eesd_train_collate_fn(None, batch)
 
         assert targets.shape == (2, 3, 3)
         assert torch.count_nonzero(targets[0, :, 2]) == 0

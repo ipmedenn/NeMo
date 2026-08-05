@@ -930,9 +930,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             spkcache_fifo_chunk_preds, spkcache_fifo_chunk_fc_encoder_lengths
         )
         if self.async_streaming:
-            if self.high_resolution:
-                saved_spkcache_lengths = streaming_state.spkcache_lengths.clone()
-                saved_fifo_lengths = streaming_state.fifo_lengths.clone()
+            saved_spkcache_lengths = streaming_state.spkcache_lengths.clone()
+            saved_fifo_lengths = streaming_state.fifo_lengths.clone()
             streaming_state, chunk_preds = self.sortformer_modules.streaming_update_async(
                 streaming_state=streaming_state,
                 chunk=chunk_pre_encode_embs,
