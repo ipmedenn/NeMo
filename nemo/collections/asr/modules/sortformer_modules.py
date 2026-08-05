@@ -516,8 +516,9 @@ class SortformerModules(NeuralModule, Exportable):
         updated_fifo = torch.zeros((batch_size, max_fifo_len + max_chunk_len, emb_dim), device=preds.device)
         updated_fifo_preds = torch.zeros((batch_size, max_fifo_len + max_chunk_len, n_spk), device=preds.device)
         updated_spkcache = torch.zeros((batch_size, max_spkcache_len + max_pop_out_len, emb_dim), device=preds.device)
+        # Negative predictions mark an unseeded cache so its first compression uses the current forward's predictions.
         updated_spkcache_preds = torch.full(
-            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), 0.0, device=preds.device
+            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), -1.0, device=preds.device
         )
 
         for batch_index in range(batch_size):
@@ -546,7 +547,7 @@ class SortformerModules(NeuralModule, Exportable):
             if fifo_len + chunk_len > max_fifo_len:
                 # move pop_out_len first frames of FIFO queue to speaker cache
                 pop_out_len = self.spkcache_update_period
-                pop_out_len = max(pop_out_len, max_chunk_len - max_fifo_len + fifo_len)
+                pop_out_len = max(pop_out_len, chunk_len - max_fifo_len + fifo_len)
                 pop_out_len = min(pop_out_len, fifo_len + chunk_len)
                 streaming_state.spkcache_lengths[batch_index] += pop_out_len
                 pop_out_embs = updated_fifo[batch_index, :pop_out_len, :]
