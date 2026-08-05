@@ -40,13 +40,15 @@ import json
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, is_dataclass
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
 
 import lightning.pytorch as pl
 import torch
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from pytorch_lightning import seed_everything
 
 from nemo.collections.asr.metrics.der import score_labels
@@ -81,8 +83,9 @@ class DiarizationConfig:
     postprocessing_yaml: Optional[str] = None  # Path to a yaml file for postprocessing configurations
     no_der: bool = False
     out_rttm_dir: Optional[str] = None
-    save_preds_tensors: bool = False
-    precision: str = "32"  # 32, bf16, bf16-mixed
+    out_preds_tensors: Optional[str] = None  # Explicit cache path; enables prediction loading and saving
+    overwrite_preds_tensors: bool = False  # Ignore and replace an existing prediction cache
+    precision: str = "bf16"  # 32, bf16, bf16-mixed
 
     # General configs
     session_len_sec: float = -1  # End-to-end diarization session length in seconds
@@ -91,6 +94,8 @@ class DiarizationConfig:
     random_seed: Optional[int] = None  # seed number going to be used in seed_everything()
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
     log: bool = False  # If True, log will be printed
+    output_subsampling_factor: Optional[int] = None  # Override prediction step in 10 ms feature frames
+    profile_inference: bool = True  # Report CUDA-synchronized preprocessor and main inference wall times
 
     use_lhotse: bool = True
     batch_duration: int = 100000
@@ -121,6 +126,85 @@ class DiarizationConfig:
     optuna_n_trials: int = 100000
 
 
+class InferenceProfiler:
+    """Measure preprocessor and main inference wall times without including evaluation."""
+
+    def __init__(self, model: SortformerEncLabelModel):
+        self.model = model
+        self.forward_time = 0.0
+        self.preprocessor_time = 0.0
+        self.forward_calls = 0
+        self.preprocessor_calls = 0
+
+    def _synchronize(self):
+        if self.model.device.type == 'cuda':
+            torch.cuda.synchronize(self.model.device)
+
+    def install(self):
+        original_process_signal = self.model.process_signal
+        original_forward = self.model.forward
+
+        def timed_process_signal(*args, **kwargs):
+            self._synchronize()
+            start = time.perf_counter()
+            try:
+                return original_process_signal(*args, **kwargs)
+            finally:
+                self._synchronize()
+                self.preprocessor_time += time.perf_counter() - start
+                self.preprocessor_calls += 1
+
+        def timed_forward(*args, **kwargs):
+            self._synchronize()
+            start = time.perf_counter()
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                self._synchronize()
+                self.forward_time += time.perf_counter() - start
+                self.forward_calls += 1
+
+        self.model.process_signal = timed_process_signal
+        self.model.forward = timed_forward
+
+    def log_summary(self, audio_duration: float):
+        main_inference_time = max(0.0, self.forward_time - self.preprocessor_time)
+        preprocessor_percent = 100 * self.preprocessor_time / self.forward_time
+        main_inference_percent = 100 * main_inference_time / self.forward_time
+        logging.info(
+            "Inference profile: "
+            f"audio={audio_duration:.2f}s, model_forward={self.forward_time:.3f}s "
+            f"(RTF={self.forward_time / audio_duration:.6f}, {audio_duration / self.forward_time:.2f}x realtime), "
+            f"preprocessor={self.preprocessor_time:.3f}s ({preprocessor_percent:.2f}%, "
+            f"RTF={self.preprocessor_time / audio_duration:.6f}), "
+            f"main_inference={main_inference_time:.3f}s ({main_inference_percent:.2f}%, "
+            f"RTF={main_inference_time / audio_duration:.6f}), "
+            f"calls={self.forward_calls}"
+        )
+
+
+def configure_output_subsampling_factor(
+    diar_model: SortformerEncLabelModel, output_subsampling_factor: Optional[int]
+) -> int:
+    """Apply an inference-time output resolution override and return the effective factor."""
+    if output_subsampling_factor is None:
+        return diar_model.output_subsampling_factor
+    if type(output_subsampling_factor) is not int or output_subsampling_factor < 1:
+        raise ValueError(f"output_subsampling_factor must be a positive integer, got {output_subsampling_factor}")
+    native_output_factor = 1 if diar_model.high_resolution else diar_model.encoder.subsampling_factor
+    if output_subsampling_factor % native_output_factor != 0:
+        logging.warning(
+            f"output_subsampling_factor={output_subsampling_factor} must be an integer multiple of the model's "
+            f"native subsampling factor ({native_output_factor}). Using {native_output_factor} instead."
+        )
+        output_subsampling_factor = native_output_factor
+
+    diar_model.output_subsampling_factor = output_subsampling_factor
+    with open_dict(diar_model._cfg):
+        diar_model._cfg.output_subsampling_factor = output_subsampling_factor
+    return output_subsampling_factor
+
+
 def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial) -> PostProcessingParams:
     """
     Suggests hyperparameters for postprocessing using Optuna.
@@ -143,24 +227,114 @@ def optuna_suggest_params(postprocessing_cfg: PostProcessingParams, trial) -> Po
     return postprocessing_cfg
 
 
-def get_tensor_path(cfg: DiarizationConfig) -> str:
+def get_tensor_path(cfg: DiarizationConfig) -> tuple[Optional[str], str, str]:
     """
-    Constructs the file path for saving or loading prediction tensors based on the configuration.
+    Resolve the explicit prediction-cache path and derive model/manifest identifiers.
 
     Args:
         cfg (DiarizationConfig): The configuration object containing model and dataset details.
 
     Returns:
-        str: The constructed file path for the prediction tensor.
+        Tuple containing the optional cache path, model identifier, and manifest identifier.
     """
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
-    model_base_path = os.path.dirname(cfg.model_path)
-    model_id = os.path.basename(cfg.model_path).replace(".ckpt", "").replace(".nemo", "")
-    bpath = f"{model_base_path}/pred_tensors"
-    if not os.path.exists(bpath):
-        os.makedirs(bpath)
-    tensor_path = f"{bpath}/__{model_id}__{tensor_filename}.pt"
-    return tensor_path, model_id, tensor_filename
+    model_path = Path(cfg.model_path).expanduser().absolute()
+    model_id = model_path.name.replace(".ckpt", "").replace(".nemo", "")
+    model_id = f"{model_id}_sf{cfg.output_subsampling_factor}"
+    if cfg.out_preds_tensors:
+        tensor_path = Path(cfg.out_preds_tensors).expanduser().absolute()
+    else:
+        tensor_path = None
+    return None if tensor_path is None else str(tensor_path), model_id, tensor_filename
+
+
+def get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) -> Dict:
+    """Describe inputs and inference settings that affect cached prediction tensors."""
+    model_path = Path(cfg.model_path).expanduser().resolve()
+    manifest_path = Path(cfg.dataset_manifest).expanduser().resolve()
+    model_stat = model_path.stat()
+    manifest_stat = manifest_path.stat()
+    modules = diar_model.sortformer_modules
+    return {
+        "version": 1,
+        "model_path": str(model_path),
+        "model_size": model_stat.st_size,
+        "model_mtime_ns": model_stat.st_mtime_ns,
+        "manifest_path": str(manifest_path),
+        "manifest_size": manifest_stat.st_size,
+        "manifest_mtime_ns": manifest_stat.st_mtime_ns,
+        "recording_ids": list(infer_audio_rttm_dict),
+        "num_speakers": int(diar_model._cfg.max_num_of_spks),
+        "output_subsampling_factor": int(cfg.output_subsampling_factor),
+        "precision": str(cfg.precision),
+        "presort_manifest": bool(cfg.presort_manifest),
+        "streaming_mode": bool(diar_model.streaming_mode),
+        "async_streaming": bool(cfg.async_streaming),
+        "chunk_len": int(cfg.chunk_len),
+        "chunk_left_context": int(cfg.chunk_left_context),
+        "chunk_right_context": int(cfg.chunk_right_context),
+        "spkcache_len": int(cfg.spkcache_len),
+        "spkcache_update_period": int(cfg.spkcache_update_period),
+        "fifo_len": int(cfg.fifo_len),
+        "strong_boost_rate": float(modules.strong_boost_rate),
+        "weak_boost_rate": float(modules.weak_boost_rate),
+        "scores_boost_latest": float(modules.scores_boost_latest),
+    }
+
+
+def validate_prediction_tensors(predictions, metadata: Dict) -> List[torch.Tensor]:
+    """Validate cached prediction count and tensor dimensions."""
+    if not isinstance(predictions, (list, tuple)):
+        raise ValueError(f"Prediction cache must contain a list of tensors, got {type(predictions).__name__}")
+    if len(predictions) != len(metadata["recording_ids"]):
+        raise ValueError(
+            f"Prediction cache contains {len(predictions)} recordings, "
+            f"but the manifest contains {len(metadata['recording_ids'])}"
+        )
+    num_speakers = metadata["num_speakers"]
+    for index, prediction in enumerate(predictions):
+        if not isinstance(prediction, torch.Tensor) or prediction.ndim != 3 or prediction.shape[0] != 1:
+            raise ValueError(f"Prediction {index} must have shape (1, frames, speakers)")
+        if prediction.shape[-1] != num_speakers:
+            raise ValueError(
+                f"Prediction {index} has {prediction.shape[-1]} speakers, but the model expects {num_speakers}"
+            )
+    return list(predictions)
+
+
+def load_prediction_tensors(tensor_path: str, expected_metadata: Dict) -> List[torch.Tensor]:
+    """Load prediction tensors and reject caches created with incompatible settings."""
+    payload = torch.load(tensor_path, weights_only=True)
+    if isinstance(payload, (list, tuple)):
+        logging.warning("Loading a legacy prediction cache without metadata validation.")
+        return validate_prediction_tensors(payload, expected_metadata)
+    if not isinstance(payload, dict) or "metadata" not in payload or "predictions" not in payload:
+        raise ValueError("Prediction cache must contain 'metadata' and 'predictions'")
+
+    cached_metadata = payload["metadata"]
+    mismatched_keys = [
+        key for key, expected_value in expected_metadata.items() if cached_metadata.get(key) != expected_value
+    ]
+    if mismatched_keys:
+        mismatch_list = ", ".join(mismatched_keys)
+        raise ValueError(
+            f"Prediction cache metadata does not match the current inference settings: {mismatch_list}. "
+            "Use overwrite_preds_tensors=True or choose a different out_preds_tensors path."
+        )
+    return validate_prediction_tensors(payload["predictions"], expected_metadata)
+
+
+def save_prediction_tensors(tensor_path: str, predictions: List[torch.Tensor], metadata: Dict) -> None:
+    """Atomically save prediction tensors and their cache-compatibility metadata."""
+    path = Path(tensor_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as tmp:
+        temporary_path = Path(tmp.name)
+    try:
+        torch.save({"metadata": metadata, "predictions": predictions}, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def diarization_objective(
@@ -169,6 +343,7 @@ def diarization_objective(
     temp_out_dir: str,
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     diar_model_preds_total_list: List[torch.Tensor],
+    unit_10ms_frame_count: int,
     collar: float = 0.25,
     ignore_overlap: bool = False,
 ) -> float:
@@ -188,6 +363,7 @@ def diarization_objective(
         diar_model_preds_total_list (List[torch.Tensor]): List of prediction matrices containing
             sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
+        unit_10ms_frame_count (int): Number of 10 ms feature frames represented by each prediction frame.
         collar (float, optional): Collar in seconds for DER calculation. Defaults to 0.25.
         ignore_overlap (bool, optional): If True, DER will be calculated only for non-overlapping segments.
             Defaults to False.
@@ -202,7 +378,7 @@ def diarization_objective(
             audio_rttm_map_dict=infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=unit_10ms_frame_count,
             bypass_postprocessing=False,
         )
         metric, _, _ = score_labels(
@@ -223,6 +399,7 @@ def run_optuna_hyperparam_search(
     infer_audio_rttm_dict: Dict[str, Dict[str, str]],
     preds_list: List[torch.Tensor],
     temp_out_dir: str,
+    unit_10ms_frame_count: int,
 ):
     """
     Run Optuna hyperparameter optimization for speaker diarization.
@@ -234,6 +411,7 @@ def run_optuna_hyperparam_search(
         preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
         temp_out_dir (str): temporary directory for storing intermediate outputs.
+        unit_10ms_frame_count (int): Number of 10 ms feature frames represented by each prediction frame.
     """
     optuna = import_optional_dependency("optuna")
 
@@ -243,6 +421,7 @@ def run_optuna_hyperparam_search(
         temp_out_dir=temp_out_dir,
         infer_audio_rttm_dict=infer_audio_rttm_dict,
         diar_model_preds_total_list=preds_list,
+        unit_10ms_frame_count=unit_10ms_frame_count,
         collar=cfg.collar,
     )
     study = optuna.create_study(
@@ -281,7 +460,9 @@ def convert_pred_mat_to_segments(
        all_uems (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
     """
     all_hypothesis, all_reference, all_uems = [], [], []
-    cfg_vad_params = OmegaConf.structured(postprocessing_cfg)
+    if postprocessing_cfg is None and not bypass_postprocessing:
+        raise ValueError("postprocessing_cfg is required when postprocessing is enabled")
+    cfg_vad_params = OmegaConf.structured(postprocessing_cfg) if postprocessing_cfg is not None else None
     total_speaker_timestamps = predlist_to_timestamps(
         batch_preds_list=batch_preds_list,
         audio_rttm_map_dict=audio_rttm_map_dict,
@@ -348,6 +529,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
 
+    cfg.output_subsampling_factor = configure_output_subsampling_factor(diar_model, cfg.output_subsampling_factor)
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
     trainer = pl.Trainer(devices=device, accelerator=accelerator, precision=cfg.precision)
     diar_model.set_trainer(trainer)
@@ -374,6 +556,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
 
     diar_model._cfg.test_ds.batch_size = cfg.batch_size
     diar_model._cfg.test_ds.pin_memory = False
+    diar_model._cfg.test_ds.num_spks = -1
 
     OmegaConf.set_struct(diar_model._cfg, False)
     diar_model._cfg.test_ds.use_lhotse = cfg.use_lhotse
@@ -396,27 +579,38 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.sortformer_modules.fifo_len = cfg.fifo_len
         diar_model.sortformer_modules.log = cfg.log
         diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
-        diar_model.sortformer_modules._check_streaming_parameters()
+        diar_model._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
     cfg.optuna_study_name = f"__{model_id}_{tensor_filename}"
     cfg.optuna_storage: str = f"sqlite:///{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.db"
     cfg.optuna_log_file: str = f"{cfg.optuna_temp_dir}/{cfg.optuna_study_name}.log"
+    inference_profiler = InferenceProfiler(diar_model) if cfg.profile_inference else None
+    if inference_profiler is not None:
+        inference_profiler.install()
 
-    if os.path.exists(tensor_path) and cfg.save_preds_tensors:
+    prediction_cache_metadata = (
+        get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) if tensor_path is not None else None
+    )
+
+    if tensor_path is not None and os.path.exists(tensor_path) and not cfg.overwrite_preds_tensors:
         logging.info(
             f"A saved prediction tensor has been found. Loading the saved prediction tensors from {tensor_path}..."
         )
-        diar_model_preds_total_list = torch.load(tensor_path)
+        diar_model_preds_total_list = load_prediction_tensors(tensor_path, prediction_cache_metadata)
     else:
         logging.info("No saved prediction tensors found. Running inference on the dataset...")
         with torch.inference_mode(), torch.autocast(device_type=diar_model.device.type, dtype=diar_model.dtype):
             diar_model.test_batch()
 
         diar_model_preds_total_list = diar_model.preds_total_list
-        if cfg.save_preds_tensors:
-            torch.save(diar_model.preds_total_list, tensor_path)
+        if inference_profiler is not None:
+            audio_duration = sum(float(item['duration']) for item in infer_audio_rttm_dict.values())
+            inference_profiler.log_summary(audio_duration)
+        if tensor_path is not None:
+            save_prediction_tensors(tensor_path, diar_model.preds_total_list, prediction_cache_metadata)
+            logging.info(f"Prediction tensors saved to {tensor_path}")
 
     if cfg.launch_pp_optim:
         # Launch a hyperparameter optimization process if launch_pp_optim is True
@@ -426,6 +620,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict=infer_audio_rttm_dict,
             preds_list=diar_model_preds_total_list,
             temp_out_dir=cfg.optuna_temp_dir,
+            unit_10ms_frame_count=cfg.output_subsampling_factor,
         )
 
     # Evaluation
@@ -438,7 +633,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
             infer_audio_rttm_dict,
             postprocessing_cfg=postprocessing_cfg,
             batch_preds_list=diar_model_preds_total_list,
-            unit_10ms_frame_count=8,
+            unit_10ms_frame_count=cfg.output_subsampling_factor,
             bypass_postprocessing=cfg.bypass_postprocessing,
             out_rttm_dir=cfg.out_rttm_dir,
         )

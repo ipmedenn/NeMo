@@ -15,11 +15,17 @@
 import json
 import os
 import tempfile
+from unittest.mock import patch
 
 import pytest
 import torch.cuda
 
-from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
+import nemo.collections.asr.data.audio_to_diar_label as audio_to_diar_label
+from nemo.collections.asr.data.audio_to_diar_label import (
+    AudioToSpeechE2ESpkDiarDataset,
+    get_frame_targets_from_rttm,
+    get_subsegments_to_timestamps,
+)
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures, WaveformFeaturizer
 from nemo.collections.asr.parts.utils.speaker_utils import get_vad_out_from_rttm_line, read_rttm_lines
 
@@ -44,9 +50,55 @@ def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec):
 
 
 class TestAudioToSpeechE2ESpkDiarDataset:
+    @pytest.mark.unit
+    def test_empty_subsegments_to_timestamps(self):
+        timestamps = get_subsegments_to_timestamps([])
+
+        assert timestamps.shape == (0, 2)
+        assert timestamps.dtype == torch.long
 
     @pytest.mark.unit
-    def test_e2e_speaker_diar_dataset(self, test_data_dir):
+    def test_collate_stacks_audio_once(self):
+        batch = [
+            (torch.tensor([1.0, 2.0]), torch.tensor(2), torch.ones(2, 2), torch.tensor([2])),
+            (torch.tensor([3.0, 4.0, 5.0]), torch.tensor(3), torch.ones(3, 2), torch.tensor([3])),
+            (torch.tensor([6.0, 7.0, 8.0, 9.0]), torch.tensor(4), torch.ones(4, 2), torch.tensor([4])),
+        ]
+
+        with patch.object(audio_to_diar_label.torch, "stack", wraps=torch.stack) as stack:
+            audio_signal, _, _, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+
+        assert stack.call_count == 4
+        assert torch.equal(
+            audio_signal,
+            torch.tensor([[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0]]),
+        )
+
+    @pytest.mark.unit
+    def test_unlimited_speaker_targets_and_collation(self):
+        frame_targets = get_frame_targets_from_rttm(
+            rttm_timestamps=([0.0, 0.2, 0.4], [0.2, 0.4, 0.6], [0, 1, 2]),
+            offset=0.0,
+            duration=1.0,
+            round_digits=2,
+            feat_per_sec=10,
+            max_spks=-1,
+        )
+        assert frame_targets.shape == (10, 3)
+        assert torch.equal(frame_targets.sum(dim=0), torch.tensor([2.0, 2.0, 2.0]))
+
+        batch = [
+            (torch.ones(4), torch.tensor(4), torch.ones(2, 2), torch.tensor([2])),
+            (torch.ones(6), torch.tensor(6), torch.ones(3, 3), torch.tensor([3])),
+        ]
+        _, _, targets, _ = audio_to_diar_label._eesd_train_collate_fn(None, batch)
+
+        assert targets.shape == (2, 3, 3)
+        assert torch.count_nonzero(targets[0, :, 2]) == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("subsampling_factor", [1, 4])
+    def test_e2e_speaker_diar_dataset(self, test_data_dir, subsampling_factor):
         manifest_path = os.path.abspath(os.path.join(test_data_dir, 'asr/diarizer/lsm_val.json'))
 
         batch_size = 4
@@ -82,9 +134,11 @@ class TestAudioToSpeechE2ESpkDiarDataset:
                 window_stride=0.01,
                 global_rank=0,
                 soft_targets=False,
+                subsampling_factor=subsampling_factor,
                 device=device,
                 fb_featurizer=fb_featurizer,
             )
+            assert dataset.subsampling_factor == subsampling_factor
             dataloader_instance = torch.utils.data.DataLoader(
                 dataset=dataset,
                 batch_size=batch_size,

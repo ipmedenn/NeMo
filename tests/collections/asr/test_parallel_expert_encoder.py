@@ -463,6 +463,27 @@ def test_pe_encoder_builds_and_wires_both_real_encoders():
 
 
 @pytest.mark.unit
+def test_pe_encoder_matches_diar_output_resolution_to_asr_encoder():
+    diar_cfg = toy_diarization_model_cfg()
+    diar_cfg.high_resolution = True
+    diar_cfg.output_subsampling_factor = 1
+
+    enc = build_toy_pe_encoder(diarization_model_cfg=diar_cfg)
+
+    assert enc.diarization_model.output_subsampling_factor == enc.asr_encoder.subsampling_factor
+    assert enc.diarization_model._cfg.output_subsampling_factor == enc.asr_encoder.subsampling_factor
+
+
+@pytest.mark.unit
+def test_pe_encoder_rejects_incompatible_diar_output_resolution():
+    asr_cfg = toy_asr_encoder_cfg()
+    asr_cfg.subsampling_factor = 4
+
+    with pytest.raises(ValueError, match="requires the diarization output subsampling factor"):
+        build_toy_pe_encoder(asr_encoder_cfg=asr_cfg)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("batch_size, n_frames", [(1, 160), (2, 200)])
 def test_pe_encoder_offline_forward_runs_internal_diarizer(batch_size, n_frames):
     enc = build_toy_pe_encoder().eval()

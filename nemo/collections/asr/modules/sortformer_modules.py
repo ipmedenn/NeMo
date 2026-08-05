@@ -37,6 +37,7 @@ class StreamingSortformerState:
         spkcache (torch.Tensor): Speaker cache to store embeddings from start
         spkcache_lengths (torch.Tensor): Lengths of the speaker cache
         spkcache_preds (torch.Tensor): The speaker predictions for the speaker cache parts
+        spkcache_has_been_compressed (bool): Whether speaker-cache selection has run
         fifo (torch.Tensor): FIFO queue to save the embedding from the latest chunks
         fifo_lengths (torch.Tensor): Lengths of the FIFO queue
         fifo_preds (torch.Tensor): The speaker predictions for the FIFO queue parts
@@ -48,6 +49,7 @@ class StreamingSortformerState:
     spkcache = None  # Speaker cache to store embeddings from start
     spkcache_lengths = None  #
     spkcache_preds = None  # speaker cache predictions
+    spkcache_has_been_compressed = False
     fifo = None  # to save the embedding from the latest chunks
     fifo_lengths = None
     fifo_preds = None
@@ -114,19 +116,42 @@ class SortformerModules(NeuralModule, Exportable):
         strong_boost_rate: float = 0.75,
         weak_boost_rate: float = 1.5,
         min_pos_scores_rate: float = 0.5,
+        use_learnable_sil_emb: bool = False,
+        upsample_factor: int = 1,
     ):
         super().__init__()
+        if not isinstance(upsample_factor, int) or isinstance(upsample_factor, bool) or upsample_factor < 1:
+            raise ValueError(f"upsample_factor must be a positive integer, got {upsample_factor}")
         # General params
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
         self.tf_d_model = tf_d_model
+        self.upsample_factor = upsample_factor
         self.hidden_size = tf_d_model
         self.n_spk: int = num_spks
         self.hidden_to_spks = nn.Linear(2 * self.hidden_size, self.n_spk)
+        self.hidden_to_spks.requires_grad_(False)
         self.first_hidden_to_hidden = nn.Linear(self.hidden_size, self.hidden_size)
         self.single_hidden_to_spks = nn.Linear(self.hidden_size, self.n_spk)
         self.dropout = nn.Dropout(dropout_rate)
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
+        self.subpixel_upsample = None
+        if self.upsample_factor > 1:
+            self.subpixel_upsample = nn.Conv1d(
+                in_channels=self.tf_d_model,
+                out_channels=self.tf_d_model * self.upsample_factor,
+                kernel_size=3,
+                padding=1,
+            )
+            with torch.no_grad():
+                self.subpixel_upsample.weight.zero_()
+                repeat_identity = torch.eye(
+                    self.tf_d_model,
+                    device=self.subpixel_upsample.weight.device,
+                    dtype=self.subpixel_upsample.weight.dtype,
+                ).repeat(self.upsample_factor, 1)
+                self.subpixel_upsample.weight[:, :, 1].copy_(repeat_identity)
+                self.subpixel_upsample.bias.zero_()
         self.log = False
 
         # Streaming-related params
@@ -147,6 +172,9 @@ class SortformerModules(NeuralModule, Exportable):
         self.strong_boost_rate = strong_boost_rate
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
+        self.use_learnable_sil_emb = use_learnable_sil_emb
+        if self.use_learnable_sil_emb:
+            self.learnable_sil_emb = nn.Parameter(torch.zeros(self.fc_d_model))
 
     def _check_streaming_parameters(self):
         """
@@ -274,6 +302,62 @@ class SortformerModules(NeuralModule, Exportable):
         spk_preds = self.single_hidden_to_spks(hidden_out)
         preds = F.sigmoid(spk_preds)
         return preds
+
+    def upsample_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Upsample transformer hidden states when high-resolution output is enabled."""
+        if self.subpixel_upsample is None:
+            return hidden_states
+        batch_size, num_frames, hidden_size = hidden_states.shape
+        projected = self.subpixel_upsample(hidden_states.transpose(1, 2)).transpose(1, 2)
+        return projected.reshape(batch_size, num_frames, self.upsample_factor, hidden_size).reshape(
+            batch_size, num_frames * self.upsample_factor, hidden_size
+        )
+
+    @staticmethod
+    def downsample_preds(preds: torch.Tensor, downsample_factor: int, lengths: torch.Tensor = None) -> torch.Tensor:
+        """
+        Average non-overlapping prediction windows while retaining a partial final window.
+
+        Args:
+            preds: Speaker probabilities with shape ``(B, T, S)``.
+            downsample_factor: Number of consecutive input frames per output frame.
+            lengths: Optional valid input lengths with shape ``(B,)``. When provided,
+                padded frames are excluded from each sample's final partial-window average.
+
+        Returns:
+            Downsampled probabilities with time length ``ceil(T / downsample_factor)``.
+        """
+        if not isinstance(downsample_factor, int) or isinstance(downsample_factor, bool) or downsample_factor < 1:
+            raise ValueError(f"downsample_factor must be a positive integer, got {downsample_factor}")
+        if preds.ndim != 3:
+            raise ValueError(f"preds must have shape (B, T, S), got {preds.shape}")
+        if downsample_factor == 1 or preds.shape[1] == 0:
+            return preds
+
+        def pool(values):
+            return F.avg_pool1d(
+                values,
+                kernel_size=downsample_factor,
+                stride=downsample_factor,
+                ceil_mode=True,
+                count_include_pad=False,
+            )
+
+        preds = preds.transpose(1, 2)
+        if lengths is not None:
+            if lengths.shape != (preds.shape[0],):
+                raise ValueError(f"lengths must have shape {(preds.shape[0],)}, got {lengths.shape}")
+            num_frames = preds.shape[2]
+            lengths = lengths.to(device=preds.device).clamp(min=0, max=num_frames)
+            valid_mask = (torch.arange(num_frames, device=preds.device).unsqueeze(0) < lengths.unsqueeze(1)).unsqueeze(
+                1
+            )
+            valid_mask = valid_mask.to(preds.dtype)
+            pooled_mask = pool(valid_mask)
+            preds = pool(preds * valid_mask) / pooled_mask.clamp_min(torch.finfo(preds.dtype).eps)
+        else:
+            preds = pool(preds)
+        return preds.transpose(1, 2)
 
     @staticmethod
     def concat_embs(
@@ -432,8 +516,9 @@ class SortformerModules(NeuralModule, Exportable):
         updated_fifo = torch.zeros((batch_size, max_fifo_len + max_chunk_len, emb_dim), device=preds.device)
         updated_fifo_preds = torch.zeros((batch_size, max_fifo_len + max_chunk_len, n_spk), device=preds.device)
         updated_spkcache = torch.zeros((batch_size, max_spkcache_len + max_pop_out_len, emb_dim), device=preds.device)
+        # Negative predictions mark an unseeded cache so its first compression uses the current forward's predictions.
         updated_spkcache_preds = torch.full(
-            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), 0.0, device=preds.device
+            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), -1.0, device=preds.device
         )
 
         for batch_index in range(batch_size):
@@ -462,20 +547,21 @@ class SortformerModules(NeuralModule, Exportable):
             if fifo_len + chunk_len > max_fifo_len:
                 # move pop_out_len first frames of FIFO queue to speaker cache
                 pop_out_len = self.spkcache_update_period
-                pop_out_len = max(pop_out_len, max_chunk_len - max_fifo_len + fifo_len)
+                pop_out_len = max(pop_out_len, chunk_len - max_fifo_len + fifo_len)
                 pop_out_len = min(pop_out_len, fifo_len + chunk_len)
                 streaming_state.spkcache_lengths[batch_index] += pop_out_len
                 pop_out_embs = updated_fifo[batch_index, :pop_out_len, :]
                 pop_out_preds = updated_fifo_preds[batch_index, :pop_out_len, :]
-                (
-                    streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                    streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                ) = self._get_silence_profile(
-                    streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                    streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                    pop_out_embs.unsqueeze(0),
-                    pop_out_preds.unsqueeze(0),
-                )
+                if not self.use_learnable_sil_emb:
+                    (
+                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
+                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
+                    ) = self._get_silence_profile(
+                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
+                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
+                        pop_out_embs.unsqueeze(0),
+                        pop_out_preds.unsqueeze(0),
+                    )
                 updated_spkcache[batch_index, spkcache_len : spkcache_len + pop_out_len, :] = pop_out_embs
                 if updated_spkcache_preds[batch_index, 0, 0] >= 0:
                     # speaker cache already compressed at least once
@@ -575,22 +661,24 @@ class SortformerModules(NeuralModule, Exportable):
 
             pop_out_embs = streaming_state.fifo[:, :pop_out_len]
             pop_out_preds = streaming_state.fifo_preds[:, :pop_out_len]
-            streaming_state.mean_sil_emb, streaming_state.n_sil_frames = self._get_silence_profile(
-                streaming_state.mean_sil_emb,
-                streaming_state.n_sil_frames,
-                pop_out_embs,
-                pop_out_preds,
-            )
+            if not self.use_learnable_sil_emb:
+                streaming_state.mean_sil_emb, streaming_state.n_sil_frames = self._get_silence_profile(
+                    streaming_state.mean_sil_emb,
+                    streaming_state.n_sil_frames,
+                    pop_out_embs,
+                    pop_out_preds,
+                )
             streaming_state.fifo = streaming_state.fifo[:, pop_out_len:]
             streaming_state.fifo_preds = streaming_state.fifo_preds[:, pop_out_len:]
 
             # append pop_out_embs to spkcache
             streaming_state.spkcache = torch.cat([streaming_state.spkcache, pop_out_embs], dim=1)
-            if streaming_state.spkcache_preds is not None:  # if speaker cache has been already updated at least once
+            if streaming_state.spkcache_has_been_compressed:
                 streaming_state.spkcache_preds = torch.cat([streaming_state.spkcache_preds, pop_out_preds], dim=1)
+            else:
+                # Before the first compression, retain fresh predictions for every current cache frame.
+                streaming_state.spkcache_preds = torch.cat([preds[:, :spkcache_len], pop_out_preds], dim=1)
             if streaming_state.spkcache.shape[1] > self.spkcache_len:
-                if streaming_state.spkcache_preds is None:  # if this is a first update of speaker cache
-                    streaming_state.spkcache_preds = torch.cat([preds[:, :spkcache_len], pop_out_preds], dim=1)
                 streaming_state.spkcache, streaming_state.spkcache_preds, streaming_state.spk_perm = (
                     self._compress_spkcache(
                         emb_seq=streaming_state.spkcache,
@@ -599,6 +687,7 @@ class SortformerModules(NeuralModule, Exportable):
                         permute_spk=self.training,
                     )
                 )
+                streaming_state.spkcache_has_been_compressed = True
 
         if self.log:
             logging.info(
@@ -732,7 +821,8 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, spkcache_len)
             is_disabled (torch.Tensor): Tensor containing binary mask for disabled frames
                 Shape: (batch_size, spkcache_len)
-            mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding
+            mean_sil_emb (torch.Tensor): Tensor containing mean silence embedding. Ignored when
+                ``use_learnable_sil_emb`` is enabled.
                 Shape: (batch_size, emb_dim)
 
         Returns:
@@ -859,6 +949,9 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, n_spk)
         """
         batch_size, n_frames, n_spk = preds.shape
+        if self.use_learnable_sil_emb:
+            mean_sil_emb = self.learnable_sil_emb.to(dtype=emb_seq.dtype, device=emb_seq.device)
+            mean_sil_emb = mean_sil_emb.unsqueeze(0).expand(batch_size, -1)
         spkcache_len_per_spk = self.spkcache_len // n_spk - self.spkcache_sil_frames_per_spk
         strong_boost_per_spk = math.floor(spkcache_len_per_spk * self.strong_boost_rate)
         weak_boost_per_spk = math.floor(spkcache_len_per_spk * self.weak_boost_rate)
