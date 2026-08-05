@@ -167,8 +167,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         sortformer_modules_cfg.subsampling_factor = self.encoder.subsampling_factor
         sortformer_modules_cfg.upsample_factor = self.upsample_factor
         self.sortformer_modules = SortformerEncLabelModel.from_config_dict(sortformer_modules_cfg).to(self.device)
-        self.transformer_encoder = SortformerEncLabelModel.from_config_dict(self._cfg.transformer_encoder).to(
-            self.device
+        transformer_encoder_cfg = self._cfg.get('transformer_encoder')
+        self.transformer_encoder = (
+            SortformerEncLabelModel.from_config_dict(transformer_encoder_cfg).to(self.device)
+            if transformer_encoder_cfg is not None
+            else None
         )
         if self._cfg.encoder.d_model != self._cfg.model_defaults.tf_d_model:
             self.sortformer_modules.encoder_proj = self.sortformer_modules.encoder_proj.to(self.device)
@@ -392,7 +395,11 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                 Shape: (batch_size, diar_frame_count, num_speakers)
         """
         encoder_mask = self.sortformer_modules.length_to_mask(emb_seq_length, emb_seq.shape[1])
-        trans_emb_seq = self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+        trans_emb_seq = (
+            self.transformer_encoder(encoder_states=emb_seq, encoder_mask=encoder_mask)
+            if self.transformer_encoder is not None
+            else emb_seq
+        )
         trans_emb_seq = self.sortformer_modules.upsample_hidden(trans_emb_seq)
         if self.high_resolution:
             output_mask = encoder_mask.repeat_interleave(self.upsample_factor, dim=1)
@@ -781,7 +788,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             rand_num = random.random()
             if rand_num < self.sortformer_modules.causal_attn_rate:
                 self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
-                self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
+                if self.transformer_encoder is not None:
+                    self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
                 att_mod = True
 
         total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
@@ -812,7 +820,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         if att_mod:
             self.encoder.att_context_size = [-1, -1]
-            self.transformer_encoder.diag = None
+            if self.transformer_encoder is not None:
+                self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length
 

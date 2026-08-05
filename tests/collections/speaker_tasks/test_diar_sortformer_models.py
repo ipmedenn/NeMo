@@ -40,7 +40,12 @@ class RecordingSpecAugment(torch.nn.Module):
         return input_spec
 
 
-def _create_sortformer_model(high_resolution=False, output_subsampling_factor=None):
+def _create_sortformer_model(
+    high_resolution=False,
+    output_subsampling_factor=None,
+    include_transformer_encoder=True,
+    frontend_encoder="conformer",
+):
     if output_subsampling_factor is None:
         output_subsampling_factor = 1 if high_resolution else 8
 
@@ -55,7 +60,7 @@ def _create_sortformer_model(high_resolution=False, output_subsampling_factor=No
         'streaming_mode': False,
     }
     model_defaults = {
-        'fc_d_model': 32,
+        'fc_d_model': 128 if frontend_encoder == "transformer" else 32,
         'tf_d_model': 16,
     }
     preprocessor = {
@@ -65,7 +70,7 @@ def _create_sortformer_model(high_resolution=False, output_subsampling_factor=No
         'sample_rate': 16000,
         'window_stride': 0.01,
         'window': 'hann',
-        'features': 80,
+        'features': 128 if frontend_encoder == "transformer" else 80,
         'n_fft': 512,
         'frame_splicing': 1,
         'dither': 0.00001,
@@ -79,35 +84,60 @@ def _create_sortformer_model(high_resolution=False, output_subsampling_factor=No
         'tf_d_model': model_defaults['tf_d_model'],
     }
 
-    encoder = {
-        '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
-        'feat_in': preprocessor['features'],
-        'feat_out': -1,
-        'n_layers': 1,
-        'd_model': model_defaults['fc_d_model'],
-        'subsampling': 'dw_striding',
-        'subsampling_factor': 8,
-        'subsampling_conv_channels': 256,
-        'causal_downsampling': False,
-        'ff_expansion_factor': 4,
-        'self_attention_model': 'rel_pos',
-        'n_heads': 8,
-        'att_context_size': [-1, -1],
-        'att_context_style': 'regular',
-        'xscaling': True,
-        'untie_biases': True,
-        'pos_emb_max_len': 5000,
-        'conv_kernel_size': 9,
-        'conv_norm_type': 'batch_norm',
-        'conv_context_size': None,
-        'dropout': 0.1,
-        'dropout_pre_encoder': 0.1,
-        'dropout_emb': 0.0,
-        'dropout_att': 0.1,
-        'stochastic_depth_drop_prob': 0.0,
-        'stochastic_depth_mode': 'linear',
-        'stochastic_depth_start_layer': 1,
-    }
+    if frontend_encoder == "transformer":
+        # Keep the production Transformer architecture and options, but scale its depth and width for CPU unit tests.
+        encoder = {
+            '_target_': 'nemo.collections.asr.modules.TransformerEncoder',
+            'feat_in': preprocessor['features'],
+            'feat_out': -1,
+            'n_layers': 1,
+            'd_model': model_defaults['fc_d_model'],
+            'n_heads': 8,
+            'subsampling': 'feature_stacking',
+            'subsampling_factor': 8,
+            'ff_expansion': 4.0,
+            'self_attention_model': 'rope',
+            'pos_emb_max_len': 5000,
+            'xscaling': False,
+            'qkv_bias': False,
+            'qk_norm': False,
+            'pre_block_norm': True,
+            'attn_mode': 'full',
+            'drop_rate': 0.1,
+            'dropout_pre_encoder': 0.1,
+            'dropout_emb': 0.0,
+            'sync_max_audio_length': True,
+        }
+    else:
+        encoder = {
+            '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
+            'feat_in': preprocessor['features'],
+            'feat_out': -1,
+            'n_layers': 1,
+            'd_model': model_defaults['fc_d_model'],
+            'subsampling': 'dw_striding',
+            'subsampling_factor': 8,
+            'subsampling_conv_channels': 256,
+            'causal_downsampling': False,
+            'ff_expansion_factor': 4,
+            'self_attention_model': 'rel_pos',
+            'n_heads': 8,
+            'att_context_size': [-1, -1],
+            'att_context_style': 'regular',
+            'xscaling': True,
+            'untie_biases': True,
+            'pos_emb_max_len': 5000,
+            'conv_kernel_size': 9,
+            'conv_norm_type': 'batch_norm',
+            'conv_context_size': None,
+            'dropout': 0.1,
+            'dropout_pre_encoder': 0.1,
+            'dropout_emb': 0.0,
+            'dropout_att': 0.1,
+            'stochastic_depth_drop_prob': 0.0,
+            'stochastic_depth_mode': 'linear',
+            'stochastic_depth_start_layer': 1,
+        }
 
     transformer_encoder = {
         '_target_': 'nemo.collections.asr.modules.transformer.transformer_encoders.TransformerEncoder',
@@ -129,27 +159,27 @@ def _create_sortformer_model(high_resolution=False, output_subsampling_factor=No
         'reduction': 'mean',
     }
 
-    modelConfig = DictConfig(
-        {
-            'sample_rate': 16000,
-            'pil_weight': 0.5,
-            'ats_weight': 0.5,
-            'max_num_of_spks': 4,
-            'high_resolution': high_resolution,
-            'output_subsampling_factor': output_subsampling_factor,
-            'model_defaults': DictConfig(model_defaults),
-            'encoder': DictConfig(encoder),
-            'transformer_encoder': DictConfig(transformer_encoder),
-            'sortformer_modules': DictConfig(sortformer_modules),
-            'preprocessor': DictConfig(preprocessor),
-            'loss': DictConfig(loss),
-            'optim': {
-                'optimizer': 'Adam',
-                'lr': 0.001,
-                'betas': (0.9, 0.98),
-            },
-        }
-    )
+    model_config = {
+        'sample_rate': 16000,
+        'pil_weight': 0.5,
+        'ats_weight': 0.5,
+        'max_num_of_spks': 4,
+        'high_resolution': high_resolution,
+        'output_subsampling_factor': output_subsampling_factor,
+        'model_defaults': DictConfig(model_defaults),
+        'encoder': DictConfig(encoder),
+        'sortformer_modules': DictConfig(sortformer_modules),
+        'preprocessor': DictConfig(preprocessor),
+        'loss': DictConfig(loss),
+        'optim': {
+            'optimizer': 'Adam',
+            'lr': 0.001,
+            'betas': (0.9, 0.98),
+        },
+    }
+    if include_transformer_encoder:
+        model_config['transformer_encoder'] = DictConfig(transformer_encoder)
+    modelConfig = DictConfig(model_config)
     model = SortformerEncLabelModel(cfg=modelConfig)
     return model
 
@@ -167,6 +197,28 @@ class TestSortformerEncLabelModelOffline:
         confdict = sortformer_diar_model.to_config_dict()
         instance2 = SortformerEncLabelModel.from_config_dict(confdict)
         assert isinstance(instance2, SortformerEncLabelModel)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("streaming_mode", [False, True])
+    def test_transformer_encoder_is_optional(self, streaming_mode):
+        model = _create_sortformer_model(
+            include_transformer_encoder=False,
+            frontend_encoder="transformer",
+        )
+        model.streaming_mode = streaming_mode
+        if streaming_mode:
+            model.sortformer_modules.causal_attn_rate = 1.0
+            model.train()
+        else:
+            model.eval()
+        audio = torch.randn(2, 8000)
+        audio_lengths = torch.tensor([8000, 6400], dtype=torch.long)
+
+        with torch.no_grad():
+            preds = model(audio, audio_lengths)
+
+        assert model.transformer_encoder is None
+        assert preds.shape[0] == audio.shape[0]
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
