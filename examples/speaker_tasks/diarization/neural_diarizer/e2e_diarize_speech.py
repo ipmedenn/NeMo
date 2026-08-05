@@ -579,7 +579,7 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.sortformer_modules.fifo_len = cfg.fifo_len
         diar_model.sortformer_modules.log = cfg.log
         diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
-        diar_model.sortformer_modules._check_streaming_parameters()
+        diar_model._check_streaming_parameters()
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)

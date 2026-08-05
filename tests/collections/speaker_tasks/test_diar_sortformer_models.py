@@ -574,7 +574,7 @@ class TestSortformerEncLabelModelHighResolution:
     @pytest.mark.parametrize("async_streaming", [False, True])
     @pytest.mark.parametrize(
         "high_resolution, output_subsampling_factor",
-        [(True, 1), (True, 3), (True, 16), (False, 16)],
+        [(True, 1), (True, 4), (True, 16), (False, 16)],
     )
     def test_full_streaming_output_uses_configured_resolution(
         self, async_streaming, high_resolution, output_subsampling_factor
@@ -593,6 +593,21 @@ class TestSortformerEncLabelModelHighResolution:
             preds = model(audio, audio_lengths)
 
         assert preds.shape[1] == math.ceil(feature_lengths.item() / output_subsampling_factor)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "high_resolution, output_subsampling_factor",
+        [(True, 3), (False, 24)],
+    )
+    def test_streaming_rejects_output_downsampling_across_chunk_boundaries(
+        self, high_resolution, output_subsampling_factor
+    ):
+        model = _create_sortformer_model(
+            high_resolution=high_resolution, output_subsampling_factor=output_subsampling_factor
+        )
+
+        with pytest.raises(ValueError, match="native chunk prediction length"):
+            model._check_streaming_parameters()
 
     @pytest.mark.unit
     @pytest.mark.parametrize("async_streaming", [False, True])

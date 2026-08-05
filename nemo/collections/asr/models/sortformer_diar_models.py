@@ -118,6 +118,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             output_factor = native_output_factor
         return high_resolution, output_factor
 
+    def _check_streaming_parameters(self):
+        """Validate module-internal and output-resolution streaming parameters."""
+        self.sortformer_modules._check_streaming_parameters()
+        native_output_factor = 1 if self.high_resolution else self.encoder.subsampling_factor
+        downsample_factor = self.output_subsampling_factor // native_output_factor
+        native_chunk_prediction_length = self.sortformer_modules.chunk_len * self.upsample_factor
+        if native_chunk_prediction_length % downsample_factor != 0:
+            raise ValueError(
+                "Streaming output downsampling requires complete pooling windows at chunk boundaries, but the "
+                f"native chunk prediction length ({native_chunk_prediction_length}) is not divisible by the "
+                f"downsample factor ({downsample_factor}). Got chunk_len={self.sortformer_modules.chunk_len}, "
+                f"upsample_factor={self.upsample_factor}, and "
+                f"output_subsampling_factor={self.output_subsampling_factor}. Choose a compatible chunk length "
+                "or output subsampling factor."
+            )
+
     def __init__(self, cfg: DictConfig, trainer: Trainer = None):
         """
         Initialize an Sortformer Diarizer model and a pretrained NEST encoder.
@@ -168,7 +184,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.streaming_mode = self._cfg.get("streaming_mode", False)
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
-            self.sortformer_modules._check_streaming_parameters()
+            self._check_streaming_parameters()
         self.save_hyperparameters("cfg")
         self._init_eval_metrics()
 
