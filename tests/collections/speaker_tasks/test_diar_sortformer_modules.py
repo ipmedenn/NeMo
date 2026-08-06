@@ -489,6 +489,32 @@ class TestSortformerModules_StreamingUtils:
         assert torch.allclose(single_total_lengths, single_length[0])
 
     @pytest.mark.unit
+    def test_concat_and_pad_ragged_tensor_widths(self):
+        """Test packing inputs with different physical widths, including empty rows."""
+        batch_size, emb_dim = 3, 4
+        embs = [
+            torch.arange(batch_size * 4 * emb_dim).reshape(batch_size, 4, emb_dim),
+            torch.arange(batch_size * 2 * emb_dim).reshape(batch_size, 2, emb_dim) + 100,
+            torch.arange(batch_size * 3 * emb_dim).reshape(batch_size, 3, emb_dim) + 200,
+        ]
+        lengths = [torch.tensor([4, 0, 2]), torch.tensor([1, 2, 0]), torch.tensor([0, 1, 3])]
+
+        output, total_lengths = SortformerModules.concat_and_pad(embs, lengths)
+
+        assert output.is_contiguous()
+        torch.testing.assert_close(total_lengths, torch.tensor([5, 3, 5]))
+        for batch_idx in range(batch_size):
+            expected = torch.cat([emb[batch_idx, : length[batch_idx]] for emb, length in zip(embs, lengths)], dim=0)
+            torch.testing.assert_close(output[batch_idx, : total_lengths[batch_idx]], expected)
+            assert torch.count_nonzero(output[batch_idx, total_lengths[batch_idx] :]) == 0
+
+        empty_output, empty_lengths = SortformerModules.concat_and_pad(
+            embs, [torch.zeros(batch_size, dtype=torch.long) for _ in embs]
+        )
+        assert empty_output.shape == (batch_size, 0, emb_dim)
+        torch.testing.assert_close(empty_lengths, torch.zeros(batch_size, dtype=torch.long))
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "tensor_shapes, dim, return_lengths, device",
         [
@@ -2111,6 +2137,38 @@ class TestSortformerModules_StreamingUpdateAsync:
         for batch_index in range(2):
             torch.testing.assert_close(streaming_state.spkcache[batch_index, :2], expected_combined[batch_index][:2])
             torch.testing.assert_close(streaming_state.fifo[batch_index, :9], expected_combined[batch_index][2:])
+
+    @pytest.mark.unit
+    def test_async_zero_capacity_fifo_masks_ragged_silence_updates(self):
+        sortformer_modules = SortformerModules(
+            num_spks=2,
+            fc_d_model=2,
+            spkcache_len=8,
+            fifo_len=0,
+            chunk_len=2,
+            spkcache_update_period=2,
+            spkcache_sil_frames_per_spk=0,
+            use_learnable_sil_emb=False,
+        )
+        streaming_state = sortformer_modules.init_streaming_state(batch_size=2, async_streaming=True)
+        chunk = torch.tensor(
+            [
+                [[1.0, 3.0], [5.0, 7.0]],
+                [[2.0, 4.0], [100.0, 200.0]],
+            ]
+        )
+        chunk_lengths = torch.tensor([2, 1])
+        preds = torch.zeros(2, 2, 2)
+
+        streaming_state, _ = sortformer_modules.streaming_update_async(streaming_state, chunk, chunk_lengths, preds)
+
+        assert streaming_state.fifo.shape == (2, 0, 2)
+        assert streaming_state.fifo_lengths.tolist() == [0, 0]
+        assert streaming_state.spkcache_lengths.tolist() == [2, 1]
+        torch.testing.assert_close(streaming_state.spkcache[0, :2], chunk[0])
+        torch.testing.assert_close(streaming_state.spkcache[1, :1], chunk[1, :1])
+        assert streaming_state.n_sil_frames.tolist() == [2, 1]
+        torch.testing.assert_close(streaming_state.mean_sil_emb, torch.tensor([[3.0, 5.0], [2.0, 4.0]]))
 
     @pytest.mark.unit
     def test_short_stream_state_is_invariant_to_longer_batch_companion(self):

@@ -192,7 +192,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._init_eval_metrics()
 
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
-        self.concat_and_pad_script = torch.jit.script(self.sortformer_modules.concat_and_pad)
         self.rttms_mask_mats: List[torch.Tensor] = None  # Used when GT diarization needs to be tested.
 
     def add_rttms_mask_mats(self, rttms_mask_mats, device: torch.device):
@@ -716,8 +715,10 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         chunk_pre_encode_lengths = chunk_pre_encode_lengths.to(torch.int64)
 
         # concat the embeddings from speaker cache, FIFO queue and the chunk
-        spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = self.concat_and_pad_script(
-            [spkcache, fifo, chunk_pre_encode_embs], [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths]
+        spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = (
+            self.sortformer_modules.concat_and_pad(
+                [spkcache, fifo, chunk_pre_encode_embs], [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths]
+            )
         )
 
         # encode the concatenated embeddings
