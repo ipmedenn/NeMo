@@ -42,6 +42,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, is_dataclass
+from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
@@ -95,7 +96,7 @@ class DiarizationConfig:
     bypass_postprocessing: bool = True  # If True, postprocessing will be bypassed
     log: bool = False  # If True, log will be printed
     output_subsampling_factor: Optional[int] = None  # Override prediction step in 10 ms feature frames
-    profile_inference: bool = True  # Report CUDA-synchronized preprocessor and main inference wall times
+    profile_inference: bool = True  # Report wall time and detailed streaming-step timings
 
     use_lhotse: bool = True
     batch_duration: int = 100000
@@ -106,6 +107,12 @@ class DiarizationConfig:
 
     # Streaming diarization configs
     async_streaming: bool = False
+    # Use fixed-size encoder inputs, trading extra padded computation for stable shapes.
+    async_pad_to_max: bool = False
+    # Compile the latency-dominant encoder; dynamic shapes support variable input lengths.
+    compile_encoder: bool = False
+    # Emulate production streams arriving independently; offline batches otherwise update in lockstep.
+    async_desync_updates: bool = False
     spkcache_len: int = 188
     spkcache_update_period: int = 144
     fifo_len: int = 188
@@ -127,7 +134,18 @@ class DiarizationConfig:
 
 
 class InferenceProfiler:
-    """Measure preprocessor and main inference wall times without including evaluation."""
+    """Measure inference wall time and streaming-step components without including evaluation."""
+
+    _STREAMING_STEP_SECTIONS = (
+        "pre_encode",
+        "state_concat",
+        "frontend_encoder",
+        "forward_infer",
+        "prediction_mask",
+        "state_update",
+        "high_resolution_extract",
+        "downsample_preds",
+    )
 
     def __init__(self, model: SortformerEncLabelModel):
         self.model = model
@@ -135,14 +153,76 @@ class InferenceProfiler:
         self.preprocessor_time = 0.0
         self.forward_calls = 0
         self.preprocessor_calls = 0
+        self.section_times: Dict[str, float] = {}
+        self.section_calls: Dict[str, int] = {}
+        self._cuda_events = {}
+        self._installed = False
 
     def _synchronize(self):
         if self.model.device.type == 'cuda':
             torch.cuda.synchronize(self.model.device)
 
+    def _flush_cuda_events(self):
+        for section, events in self._cuda_events.items():
+            elapsed = sum(start.elapsed_time(end) for start, end in events) / 1000
+            self.section_times[section] = self.section_times.get(section, 0.0) + elapsed
+        self._cuda_events.clear()
+
+    def _section_wrapper(self, section, function):
+        @wraps(function)
+        def timed_function(*args, **kwargs):
+            self.section_calls[section] = self.section_calls.get(section, 0) + 1
+            if self.model.device.type == 'cuda':
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                stream = torch.cuda.current_stream(self.model.device)
+                start.record(stream)
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    end.record(stream)
+                    self._cuda_events.setdefault(section, []).append((start, end))
+
+            start = time.perf_counter()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                self.section_times[section] = self.section_times.get(section, 0.0) + (time.perf_counter() - start)
+
+        return timed_function
+
+    def _install_section(self, instance, method_name, section):
+        original_method = getattr(instance, method_name)
+        setattr(instance, method_name, self._section_wrapper(section, original_method))
+
     def install(self):
+        if self._installed:
+            return
+        self._installed = True
+
         original_process_signal = self.model.process_signal
         original_forward = self.model.forward
+        sortformer_modules = self.model.sortformer_modules
+
+        self._install_section(self.model, "_call_pre_encode", "pre_encode")
+        self._install_section(sortformer_modules, "concat_and_pad", "state_concat")
+        self._install_section(sortformer_modules, "concat_embs", "state_concat")
+        if hasattr(self.model.frontend_encoder, "forward"):
+            self._install_section(self.model.frontend_encoder, "forward", "frontend_encoder")
+        else:
+            self._install_section(self.model, "frontend_encoder", "frontend_encoder")
+        self._install_section(self.model, "forward_infer", "forward_infer")
+        self._install_section(sortformer_modules, "apply_mask_to_preds", "prediction_mask")
+        self._install_section(sortformer_modules, "streaming_update_async", "state_update")
+        self._install_section(sortformer_modules, "streaming_update", "state_update")
+        self._install_section(
+            self.model,
+            "_extract_async_high_resolution_chunk_preds",
+            "high_resolution_extract",
+        )
+        self._install_section(sortformer_modules, "downsample_preds", "downsample_preds")
+        self._install_section(sortformer_modules, "_compress_spkcache", "cache_compress")
+        self._install_section(self.model, "forward_streaming_step", "streaming_step")
 
         def timed_process_signal(*args, **kwargs):
             self._synchronize()
@@ -163,11 +243,21 @@ class InferenceProfiler:
                 self._synchronize()
                 self.forward_time += time.perf_counter() - start
                 self.forward_calls += 1
+                self._flush_cuda_events()
 
         self.model.process_signal = timed_process_signal
         self.model.forward = timed_forward
 
     def log_summary(self, audio_duration: float):
+        self._synchronize()
+        self._flush_cuda_events()
+        if audio_duration <= 0 or self.forward_time <= 0:
+            logging.warning(
+                f"Cannot summarize inference profile with audio_duration={audio_duration} "
+                f"and forward_time={self.forward_time}."
+            )
+            return
+
         main_inference_time = max(0.0, self.forward_time - self.preprocessor_time)
         preprocessor_percent = 100 * self.preprocessor_time / self.forward_time
         main_inference_percent = 100 * main_inference_time / self.forward_time
@@ -181,6 +271,39 @@ class InferenceProfiler:
             f"RTF={main_inference_time / audio_duration:.6f}), "
             f"calls={self.forward_calls}"
         )
+
+        streaming_step_time = self.section_times.get("streaming_step", 0.0)
+        if streaming_step_time <= 0:
+            return
+
+        measured_step_time = sum(self.section_times.get(section, 0.0) for section in self._STREAMING_STEP_SECTIONS)
+        other_step_time = max(0.0, streaming_step_time - measured_step_time)
+        logging.info(
+            f"Streaming step profile: total={streaming_step_time:.3f}s, "
+            f"calls={self.section_calls.get('streaming_step', 0)}, "
+            f"per_call={1000 * streaming_step_time / self.section_calls['streaming_step']:.3f}ms"
+        )
+        for section in self._STREAMING_STEP_SECTIONS:
+            section_time = self.section_times.get(section, 0.0)
+            if section_time <= 0:
+                continue
+            calls = self.section_calls.get(section, 0)
+            logging.info(
+                f"  {section}: total={section_time:.3f}s, "
+                f"step={100 * section_time / streaming_step_time:.2f}%, "
+                f"calls={calls}, per_call={1000 * section_time / calls:.3f}ms"
+            )
+        logging.info(f"  other: total={other_step_time:.3f}s, step={100 * other_step_time / streaming_step_time:.2f}%")
+
+        cache_compress_time = self.section_times.get("cache_compress", 0.0)
+        state_update_time = self.section_times.get("state_update", 0.0)
+        if cache_compress_time > 0 and state_update_time > 0:
+            calls = self.section_calls["cache_compress"]
+            logging.info(
+                f"  cache_compress (inside state_update): total={cache_compress_time:.3f}s, "
+                f"state_update={100 * cache_compress_time / state_update_time:.2f}%, "
+                f"calls={calls}, per_call={1000 * cache_compress_time / calls:.3f}ms"
+            )
 
 
 def configure_output_subsampling_factor(
@@ -270,6 +393,8 @@ def get_prediction_cache_metadata(cfg, diar_model, infer_audio_rttm_dict) -> Dic
         "presort_manifest": bool(cfg.presort_manifest),
         "streaming_mode": bool(diar_model.streaming_mode),
         "async_streaming": bool(cfg.async_streaming),
+        "async_pad_to_max": bool(cfg.async_pad_to_max),
+        "async_desync_updates": bool(cfg.async_desync_updates),
         "chunk_len": int(cfg.chunk_len),
         "chunk_left_context": int(cfg.chunk_left_context),
         "chunk_right_context": int(cfg.chunk_right_context),
@@ -572,6 +697,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     # Streaming mode setup (only if enabled)
     if diar_model.streaming_mode:
         diar_model.async_streaming = cfg.async_streaming
+        diar_model.async_pad_to_max = cfg.async_pad_to_max
+        diar_model.sortformer_modules.async_desync_updates = cfg.async_desync_updates
         diar_model.sortformer_modules.chunk_len = cfg.chunk_len
         diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
         diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
@@ -580,6 +707,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.sortformer_modules.log = cfg.log
         diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
         diar_model._check_streaming_parameters()
+
+    if cfg.compile_encoder:
+        logging.info("Compiling the frontend encoder")
+        diar_model.encoder = torch.compile(diar_model.encoder, dynamic=True)
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)

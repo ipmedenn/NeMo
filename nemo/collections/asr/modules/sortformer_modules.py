@@ -14,7 +14,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -37,7 +37,8 @@ class StreamingSortformerState:
         spkcache (torch.Tensor): Speaker cache to store embeddings from start
         spkcache_lengths (torch.Tensor): Lengths of the speaker cache
         spkcache_preds (torch.Tensor): The speaker predictions for the speaker cache parts
-        spkcache_has_been_compressed (bool): Whether speaker-cache selection has run
+        spkcache_compressed (bool or torch.Tensor): Whether speaker-cache compression has run. A scalar is used for
+            synchronous streaming and per-row flags are used for asynchronous streaming.
         fifo (torch.Tensor): FIFO queue to save the embedding from the latest chunks
         fifo_lengths (torch.Tensor): Lengths of the FIFO queue
         fifo_preds (torch.Tensor): The speaker predictions for the FIFO queue parts
@@ -49,7 +50,7 @@ class StreamingSortformerState:
     spkcache = None  # Speaker cache to store embeddings from start
     spkcache_lengths = None  #
     spkcache_preds = None  # speaker cache predictions
-    spkcache_has_been_compressed = False
+    spkcache_compressed = False
     fifo = None  # to save the embedding from the latest chunks
     fifo_lengths = None
     fifo_preds = None
@@ -64,6 +65,8 @@ class StreamingSortformerState:
             self.spkcache_lengths = self.spkcache_lengths.to(device)
         if self.spkcache_preds is not None:
             self.spkcache_preds = self.spkcache_preds.to(device)
+        if isinstance(self.spkcache_compressed, torch.Tensor):
+            self.spkcache_compressed = self.spkcache_compressed.to(device)
         if self.fifo is not None:
             self.fifo = self.fifo.to(device)
         if self.fifo_lengths is not None:
@@ -118,6 +121,7 @@ class SortformerModules(NeuralModule, Exportable):
         min_pos_scores_rate: float = 0.5,
         use_learnable_sil_emb: bool = False,
         upsample_factor: int = 1,
+        async_desync_updates: bool = False,
     ):
         super().__init__()
         if not isinstance(upsample_factor, int) or isinstance(upsample_factor, bool) or upsample_factor < 1:
@@ -173,6 +177,7 @@ class SortformerModules(NeuralModule, Exportable):
         self.weak_boost_rate = weak_boost_rate
         self.min_pos_scores_rate = min_pos_scores_rate
         self.use_learnable_sil_emb = use_learnable_sil_emb
+        self.async_desync_updates = async_desync_updates
         if self.use_learnable_sil_emb:
             self.learnable_sil_emb = nn.Parameter(torch.zeros(self.fc_d_model))
 
@@ -386,13 +391,14 @@ class SortformerModules(NeuralModule, Exportable):
             return embs
 
     @staticmethod
-    def concat_and_pad(embs: List[torch.Tensor], lengths: List[torch.Tensor]):
+    def concat_and_pad(embs: List[torch.Tensor], lengths: List[torch.Tensor], output_length: Optional[int] = None):
         """
         Concatenates lengths[i] first embeddings of embs[i], and pads the rest elements with zeros.
 
         Args:
             embs: List of embeddings Tensors of (batch_size, n_frames, emb_dim) shape
             lengths: List of lengths Tensors of (batch_size,) shape
+            output_length: Optional fixed output width. It must fit every row's valid concatenated frames.
 
         Returns:
             output: concatenated embeddings Tensor of (batch_size, n_frames, emb_dim) shape
@@ -414,7 +420,12 @@ class SortformerModules(NeuralModule, Exportable):
         batch_size, emb_dim = embs[0].shape[0], embs[0].shape[2]
 
         total_lengths = torch.sum(torch.stack(lengths), dim=0)
-        sig_length = total_lengths.max().item()
+        required_length = total_lengths.max().item()
+        if output_length is not None and output_length < required_length:
+            raise ValueError(
+                f"output_length ({output_length}) must be at least the maximum total length ({required_length})."
+            )
+        sig_length = required_length if output_length is None else output_length
 
         # Reserve one extra position as the destination for invalid/padded source frames.
         # This keeps all indexing tensors rectangular and avoids a Python loop over the batch.
@@ -455,6 +466,7 @@ class SortformerModules(NeuralModule, Exportable):
             streaming_state.spkcache = torch.zeros((batch_size, self.spkcache_len, self.fc_d_model), device=device)
             streaming_state.spkcache_preds = torch.zeros((batch_size, self.spkcache_len, self.n_spk), device=device)
             streaming_state.spkcache_lengths = torch.zeros((batch_size,), dtype=torch.long, device=device)
+            streaming_state.spkcache_compressed = torch.zeros((batch_size,), dtype=torch.bool, device=device)
             streaming_state.fifo = torch.zeros((batch_size, self.fifo_len, self.fc_d_model), device=device)
             streaming_state.fifo_lengths = torch.zeros((batch_size,), dtype=torch.long, device=device)
         else:
@@ -516,7 +528,8 @@ class SortformerModules(NeuralModule, Exportable):
             chunk.shape[1] - lc - rc,
         )
 
-        max_pop_out_len = max(self.spkcache_update_period, max_chunk_len)
+        # A finalized row may flush its entire FIFO, so the temporary pop buffer must fit max_fifo_len.
+        max_pop_out_len = max(self.spkcache_update_period, max_fifo_len, max_chunk_len)
         max_pop_out_len = min(max_pop_out_len, max_chunk_len + max_fifo_len)
 
         spkcache_lengths = streaming_state.spkcache_lengths
@@ -553,6 +566,18 @@ class SortformerModules(NeuralModule, Exportable):
             torch.minimum(combined_fifo_lengths, torch.maximum(update_period, overflow_lengths)),
             torch.zeros_like(combined_fifo_lengths),
         )
+        if self.async_desync_updates:
+            # Offline batches start all streams together, hiding the ragged update phases seen when
+            # production streams arrive independently. Stagger those phases by randomizing the first pop.
+            first_fifo_pop = (spkcache_lengths == 0) & (combined_fifo_lengths > max_fifo_len) & (chunk_lengths > 0)
+            random_pop_range = (pop_out_lengths - overflow_lengths + 1).clamp_min(1)
+            random_pop_offsets = torch.floor(
+                torch.rand_like(combined_fifo_lengths, dtype=torch.float32) * random_pop_range
+            ).to(torch.long)
+            random_pop_lengths = overflow_lengths + random_pop_offsets
+            pop_out_lengths = torch.where(first_fifo_pop, random_pop_lengths, pop_out_lengths)
+        # A zero-length chunk marks a finalized row; flush its remaining FIFO into the speaker cache.
+        pop_out_lengths = torch.where(chunk_lengths == 0, fifo_lengths, pop_out_lengths)
         new_fifo_lengths = combined_fifo_lengths - pop_out_lengths
 
         # Treat the old FIFO and current chunk as a per-row logical concatenation. Gather both
@@ -621,14 +646,9 @@ class SortformerModules(NeuralModule, Exportable):
         # Build the compression candidates as [valid cache | popped FIFO] for every row.
         updated_spkcache_lengths = spkcache_lengths + pop_out_lengths
         need_compress = updated_spkcache_lengths > self.spkcache_len
-        spkcache_seeded = (spkcache_lengths > 0) & (streaming_state.spkcache_preds[:, 0, 0] >= 0)
-        first_compression = (~spkcache_seeded) & need_compress
+        first_compression = (~streaming_state.spkcache_compressed) & need_compress
         candidate_old_preds = torch.where(
             first_compression.view(-1, 1, 1), current_spkcache_preds, streaming_state.spkcache_preds
-        )
-        write_pop_preds = spkcache_seeded | first_compression
-        candidate_pop_preds = torch.where(
-            write_pop_preds.view(-1, 1, 1), pop_out_preds, torch.full_like(pop_out_preds, -1.0)
         )
         candidate_spkcache_embs = torch.cat(
             [
@@ -641,8 +661,8 @@ class SortformerModules(NeuralModule, Exportable):
         candidate_spkcache_preds = torch.cat(
             [
                 candidate_old_preds,
-                candidate_pop_preds,
-                streaming_state.spkcache_preds.new_full((batch_size, 1, n_spk), -1.0),
+                pop_out_preds,
+                streaming_state.spkcache_preds.new_zeros((batch_size, 1, n_spk)),
             ],
             dim=1,
         )
@@ -679,6 +699,7 @@ class SortformerModules(NeuralModule, Exportable):
                 mean_sil_emb=streaming_state.mean_sil_emb[idx],
                 permute_spk=False,
             )
+            streaming_state.spkcache_compressed[idx] = True
         streaming_state.spkcache_lengths.copy_(updated_spkcache_lengths.clamp(max=self.spkcache_len))
 
         if self.log:
@@ -755,7 +776,7 @@ class SortformerModules(NeuralModule, Exportable):
 
             # append pop_out_embs to spkcache
             streaming_state.spkcache = torch.cat([streaming_state.spkcache, pop_out_embs], dim=1)
-            if streaming_state.spkcache_has_been_compressed:
+            if streaming_state.spkcache_compressed:
                 streaming_state.spkcache_preds = torch.cat([streaming_state.spkcache_preds, pop_out_preds], dim=1)
             else:
                 # Before the first compression, retain fresh predictions for every current cache frame.
@@ -769,7 +790,7 @@ class SortformerModules(NeuralModule, Exportable):
                         permute_spk=self.training,
                     )
                 )
-                streaming_state.spkcache_has_been_compressed = True
+                streaming_state.spkcache_compressed = True
 
         if self.log:
             logging.info(

@@ -184,6 +184,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.loss = safe_instantiate(self._cfg.loss)
 
         self.async_streaming = self._cfg.get("async_streaming", False)
+        # Async rows are ragged; padding to full state capacity keeps the encoder time dimension fixed.
+        self.async_pad_to_max = self._cfg.get("async_pad_to_max", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
@@ -830,6 +832,38 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         total_preds = total_preds[:, :output_frames]
         return total_preds
 
+    def _extract_async_high_resolution_chunk_preds(
+        self,
+        high_resolution_preds,
+        spkcache_lengths,
+        fifo_lengths,
+        chunk_lengths,
+        max_chunk_len,
+        lc_enc,
+    ):
+        """Gather ragged high-resolution chunk predictions without synchronizing lengths to Python."""
+        batch_size, _, num_speakers = high_resolution_preds.shape
+        output_length = max_chunk_len * self.upsample_factor
+        output_positions = torch.arange(output_length, device=high_resolution_preds.device).unsqueeze(0)
+        output_lengths = chunk_lengths.unsqueeze(1) * self.upsample_factor
+        start_indices = (spkcache_lengths + fifo_lengths + lc_enc).unsqueeze(1) * self.upsample_factor
+        source_indices = start_indices + output_positions
+        valid_mask = output_positions < output_lengths
+        padding_index = high_resolution_preds.shape[1]
+        source_indices = torch.where(valid_mask, source_indices, padding_index)
+        padded_preds = torch.cat(
+            [
+                high_resolution_preds,
+                high_resolution_preds.new_zeros((batch_size, 1, num_speakers)),
+            ],
+            dim=1,
+        )
+        return torch.gather(
+            padded_preds,
+            1,
+            source_indices.unsqueeze(-1).expand(-1, -1, num_speakers),
+        )
+
     def forward_streaming_step(
         self,
         processed_signal,
@@ -856,6 +890,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     spkcache (torch.Tensor): Speaker cache to store embeddings from start
                     spkcache_lengths (torch.Tensor): Lengths of the speaker cache
                     spkcache_preds (torch.Tensor): The speaker predictions for the speaker cache parts
+                    spkcache_compressed (bool or torch.Tensor): Speaker-cache compression status
                     fifo (torch.Tensor): FIFO queue to save the embedding from the latest chunks
                     fifo_lengths (torch.Tensor): Lengths of the FIFO queue
                     fifo_preds (torch.Tensor): The speaker predictions for the FIFO queue parts
@@ -883,10 +918,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             chunk_pre_encode_lengths = chunk_pre_encode_lengths - drop_extra_pre_encoded
 
         if self.async_streaming:
+            output_length = None
+            if self.async_pad_to_max:
+                output_length = (
+                    streaming_state.spkcache.shape[1]
+                    + streaming_state.fifo.shape[1]
+                    + self.sortformer_modules.chunk_left_context
+                    + self.sortformer_modules.chunk_len
+                    + self.sortformer_modules.chunk_right_context
+                )
             spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = (
                 self.sortformer_modules.concat_and_pad(
                     [streaming_state.spkcache, streaming_state.fifo, chunk_pre_encode_embs],
                     [streaming_state.spkcache_lengths, streaming_state.fifo_lengths, chunk_pre_encode_lengths],
+                    output_length=output_length,
                 )
             )
         else:
@@ -945,19 +990,14 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             if self.high_resolution:
                 max_chunk_len = chunk_pre_encode_embs.shape[1] - lc_enc - rc_enc
                 chunk_lengths = (chunk_pre_encode_lengths - lc_enc).clamp(min=0, max=max_chunk_len)
-                chunk_preds = high_resolution_preds.new_zeros(
-                    (
-                        high_resolution_preds.shape[0],
-                        max_chunk_len * self.upsample_factor,
-                        high_resolution_preds.shape[2],
-                    )
+                chunk_preds = self._extract_async_high_resolution_chunk_preds(
+                    high_resolution_preds=high_resolution_preds,
+                    spkcache_lengths=saved_spkcache_lengths,
+                    fifo_lengths=saved_fifo_lengths,
+                    chunk_lengths=chunk_lengths,
+                    max_chunk_len=max_chunk_len,
+                    lc_enc=lc_enc,
                 )
-                for batch_index in range(high_resolution_preds.shape[0]):
-                    start = (
-                        saved_spkcache_lengths[batch_index] + saved_fifo_lengths[batch_index] + lc_enc
-                    ).item() * self.upsample_factor
-                    length = chunk_lengths[batch_index].item() * self.upsample_factor
-                    chunk_preds[batch_index, :length] = high_resolution_preds[batch_index, start : start + length]
         else:
             saved_spkcache_len = streaming_state.spkcache.shape[1]
             saved_fifo_len = streaming_state.fifo.shape[1]
