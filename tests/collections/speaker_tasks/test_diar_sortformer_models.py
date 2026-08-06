@@ -16,6 +16,8 @@ import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+import onnx
 import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
@@ -26,6 +28,7 @@ from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech impor
     save_prediction_tensors,
 )
 from omegaconf import DictConfig
+from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
@@ -278,6 +281,52 @@ class TestSortformerEncLabelModelStreaming:
 
         assert encoded.shape == (2, 15, sortformer_model._cfg.model_defaults.fc_d_model)
         assert torch.equal(encoded_lengths, torch.tensor([15, 12]))
+
+    @pytest.mark.unit
+    def test_streaming_input_examples_match_model_dimensions(self, sortformer_model):
+        sortformer_model.sortformer_modules.spkcache_len = 5
+        sortformer_model.sortformer_modules.fifo_len = 7
+        sortformer_model.sortformer_modules.chunk_len = 3
+        sortformer_model.sortformer_modules.chunk_left_context = 1
+        sortformer_model.sortformer_modules.chunk_right_context = 2
+
+        chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths = (
+            sortformer_model.streaming_input_examples(batch_size=2)
+        )
+
+        chunk_frames = (1 + 3 + 2) * sortformer_model.encoder.subsampling_factor
+        assert chunk.shape == (2, chunk_frames, sortformer_model.encoder._feat_in)
+        assert chunk_lengths.tolist() == [chunk_frames, chunk_frames]
+        assert spkcache.shape == (2, 5, sortformer_model.sortformer_modules.fc_d_model)
+        assert fifo.shape == (2, 7, sortformer_model.sortformer_modules.fc_d_model)
+        assert torch.all(spkcache_lengths <= spkcache.shape[1])
+        assert torch.all(fifo_lengths <= fifo.shape[1])
+        with torch.no_grad():
+            chunk_pre_encode_embs, chunk_pre_encode_lengths = sortformer_model._call_pre_encode(chunk, chunk_lengths)
+        assert chunk_pre_encode_embs.shape[1] == 1 + 3 + 2
+        assert chunk_pre_encode_lengths.tolist() == [1 + 3 + 2, 1 + 3 + 2]
+
+    @pytest.mark.unit
+    def test_streaming_export_accepts_explicit_input_example(self, sortformer_model):
+        input_example = tuple(torch.empty(0) for _ in sortformer_model.input_names)
+        with patch.object(sortformer_model, "export", return_value="exported") as export_mock:
+            result = sortformer_model.streaming_export("model.onnx", input_example=input_example)
+
+        assert result == "exported"
+        export_mock.assert_called_once_with("model.onnx", input_example=input_example)
+
+    @pytest.mark.unit
+    def test_streaming_export_uses_model_sized_defaults(self, sortformer_model):
+        input_example = tuple(torch.empty(0) for _ in sortformer_model.input_names)
+        with (
+            patch.object(sortformer_model, "streaming_input_examples", return_value=input_example) as examples_mock,
+            patch.object(sortformer_model, "export", return_value="exported") as export_mock,
+        ):
+            result = sortformer_model.streaming_export("model.onnx", batch_size=2)
+
+        assert result == "exported"
+        examples_mock.assert_called_once_with(batch_size=2)
+        export_mock.assert_called_once_with("model.onnx", input_example=input_example)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("async_streaming", [False, True])
@@ -843,6 +892,45 @@ class TestSortformerEncLabelModelHighResolution:
             )
 
         assert preds.shape[1] == chunk_pre_encode_lengths.max()
+
+    @pytest.mark.unit
+    def test_streaming_onnx_export_handles_runtime_state_lengths(self, tmp_path):
+        model = _create_sortformer_model().eval()
+        batch_size, state_capacity = 2, 8
+        chunk = torch.randn(batch_size, 24, model.encoder._feat_in)
+        chunk_lengths = torch.tensor([24, 16])
+        spkcache = torch.randn(batch_size, state_capacity, model.sortformer_modules.fc_d_model)
+        fifo = torch.randn(batch_size, state_capacity, model.sortformer_modules.fc_d_model)
+        export_inputs = (
+            chunk,
+            chunk_lengths,
+            spkcache,
+            torch.tensor([2, 5]),
+            fifo,
+            torch.tensor([3, 4]),
+        )
+        runtime_state_lengths = (
+            (torch.tensor([0, 0]), torch.tensor([0, 0])),
+            (torch.tensor([4, 7]), torch.tensor([6, 1])),
+            (torch.tensor([state_capacity, state_capacity]), torch.tensor([state_capacity, state_capacity])),
+        )
+        with torch.no_grad():
+            expected_outputs = [
+                model.forward_for_export(chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths)
+                for spkcache_lengths, fifo_lengths in runtime_state_lengths
+            ]
+
+        output_path = tmp_path / "streaming_sortformer.onnx"
+        model.export(str(output_path), input_example=export_inputs, dynamic_axes={})
+        evaluator = ReferenceEvaluator(onnx.load(output_path))
+
+        for (spkcache_lengths, fifo_lengths), expected in zip(runtime_state_lengths, expected_outputs):
+            inputs = (chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths)
+            actual = evaluator.run(
+                None, {name: value.detach().cpu().numpy() for name, value in zip(model.input_names, inputs)}
+            )
+            for actual_tensor, expected_tensor in zip(actual, expected):
+                np.testing.assert_allclose(actual_tensor, expected_tensor.detach().cpu().numpy(), rtol=1e-4, atol=1e-4)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

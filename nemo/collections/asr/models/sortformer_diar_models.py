@@ -666,22 +666,33 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def output_names(self):
         return ["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"]
 
-    def streaming_input_examples(self):
-        """Input tensor examples for exporting streaming version of model"""
-        batch_size = 4
-        chunk = torch.rand([batch_size, 120, 80]).to(self.device)
-        chunk_lengths = torch.tensor([120] * batch_size).to(self.device)
-        spkcache = torch.randn([batch_size, 188, 512]).to(self.device)
-        spkcache_lengths = torch.tensor([40, 188, 0, 68]).to(self.device)
-        fifo = torch.randn([batch_size, 188, 512]).to(self.device)
-        fifo_lengths = torch.tensor([50, 88, 0, 90]).to(self.device)
+    def streaming_input_examples(self, batch_size: int = 1):
+        """Create model-sized input examples for exporting the streaming graph."""
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
+
+        chunk_frames = (
+            self.sortformer_modules.chunk_left_context
+            + self.sortformer_modules.chunk_len
+            + self.sortformer_modules.chunk_right_context
+        ) * self.encoder.subsampling_factor
+        spkcache_capacity = self.sortformer_modules.spkcache_len
+        fifo_capacity = self.sortformer_modules.fifo_len
+        embedding_dim = self.sortformer_modules.fc_d_model
+
+        chunk = torch.rand((batch_size, chunk_frames, self.encoder._feat_in), device=self.device)
+        chunk_lengths = torch.full((batch_size,), chunk_frames, dtype=torch.long, device=self.device)
+        spkcache = torch.randn((batch_size, spkcache_capacity, embedding_dim), device=self.device)
+        spkcache_lengths = torch.full((batch_size,), spkcache_capacity // 2, dtype=torch.long, device=self.device)
+        fifo = torch.randn((batch_size, fifo_capacity, embedding_dim), device=self.device)
+        fifo_lengths = torch.full((batch_size,), fifo_capacity // 2, dtype=torch.long, device=self.device)
         return chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths
 
-    def streaming_export(self, output: str):
-        """Exports the model for streaming inference."""
-        input_example = self.streaming_input_examples()
-        export_out = self.export(output, input_example=input_example)
-        return export_out
+    def streaming_export(self, output: str, input_example=None, batch_size: int = 1):
+        """Export the streaming graph with explicit inputs or model-sized defaults."""
+        if input_example is None:
+            input_example = self.streaming_input_examples(batch_size=batch_size)
+        return self.export(output, input_example=input_example)
 
     def forward_for_export(self, chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths):
         """
@@ -717,9 +728,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         chunk_pre_encode_lengths = chunk_pre_encode_lengths.to(torch.int64)
 
         # concat the embeddings from speaker cache, FIFO queue and the chunk
+        output_length = spkcache.shape[1] + fifo.shape[1] + chunk_pre_encode_embs.shape[1]
         spkcache_fifo_chunk_pre_encode_embs, spkcache_fifo_chunk_pre_encode_lengths = (
             self.sortformer_modules.concat_and_pad(
-                [spkcache, fifo, chunk_pre_encode_embs], [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths]
+                [spkcache, fifo, chunk_pre_encode_embs],
+                [spkcache_lengths, fifo_lengths, chunk_pre_encode_lengths],
+                output_length=output_length,
             )
         )
 
