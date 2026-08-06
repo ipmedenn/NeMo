@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
+    InferenceProfiler,
     configure_output_subsampling_factor,
     get_tensor_path,
     load_prediction_tensors,
@@ -279,6 +280,95 @@ class TestSortformerEncLabelModelStreaming:
         assert torch.equal(encoded_lengths, torch.tensor([15, 12]))
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("async_streaming", [False, True])
+    def test_inference_profiler_reports_streaming_sections(self, sortformer_model, async_streaming):
+        sortformer_model.streaming_mode = True
+        sortformer_model.async_streaming = async_streaming
+        sortformer_model.eval()
+        profiler = InferenceProfiler(sortformer_model)
+        profiler.install()
+        profiler.install()
+
+        with torch.no_grad():
+            sortformer_model(torch.randn(2, 8000), torch.tensor([8000, 6000]))
+        profiler.log_summary(audio_duration=1.0)
+
+        expected_sections = {
+            "streaming_step",
+            "pre_encode",
+            "state_concat",
+            "frontend_encoder",
+            "forward_infer",
+            "prediction_mask",
+            "state_update",
+        }
+        assert profiler.forward_calls == 1
+        assert expected_sections <= profiler.section_times.keys()
+        assert all(profiler.section_times[section] > 0 for section in expected_sections)
+        assert all(profiler.section_calls[section] > 0 for section in expected_sections)
+
+    @pytest.mark.unit
+    def test_async_streaming_can_pad_encoder_input_to_max_length(self, sortformer_model):
+        sortformer_model.streaming_mode = True
+        sortformer_model.async_streaming = True
+        sortformer_model.async_pad_to_max = True
+        sortformer_model.sortformer_modules.spkcache_len = 5
+        sortformer_model.sortformer_modules.fifo_len = 7
+        sortformer_model.sortformer_modules.chunk_len = 3
+        sortformer_model.sortformer_modules.chunk_left_context = 1
+        sortformer_model.sortformer_modules.chunk_right_context = 2
+        sortformer_model.eval()
+
+        batch_size = 2
+        streaming_state = sortformer_model.sortformer_modules.init_streaming_state(
+            batch_size=batch_size, async_streaming=True
+        )
+        frontend_inputs = []
+        frontend_encoder = sortformer_model.frontend_encoder
+
+        def capture_frontend_input(*args, **kwargs):
+            frontend_inputs.append(kwargs["processed_signal"].shape)
+            return frontend_encoder(*args, **kwargs)
+
+        sortformer_model.frontend_encoder = capture_frontend_input
+        with torch.no_grad():
+            sortformer_model.forward_streaming_step(
+                processed_signal=torch.randn(batch_size, 48, 80),
+                processed_signal_length=torch.tensor([48, 24]),
+                streaming_state=streaming_state,
+                total_preds=torch.zeros(batch_size, 0, sortformer_model._cfg.max_num_of_spks),
+            )
+
+        assert frontend_inputs == [torch.Size([batch_size, 18, 32])]
+
+    @pytest.mark.unit
+    def test_async_streaming_flushes_fifo_for_finalized_rows(self, sortformer_model):
+        sortformer_model.streaming_mode = True
+        sortformer_model.async_streaming = True
+        sortformer_model.sortformer_modules.chunk_len = 6
+        sortformer_model.eval()
+        streaming_update_async = sortformer_model.sortformer_modules.streaming_update_async
+        updates = []
+
+        def capture_streaming_update(**kwargs):
+            state, chunk_preds = streaming_update_async(**kwargs)
+            max_chunk_len = kwargs["chunk"].shape[1] - kwargs["lc"] - kwargs["rc"]
+            finalized = (kwargs["chunk_lengths"] - kwargs["lc"]).clamp(min=0, max=max_chunk_len) == 0
+            updates.append((finalized, state.fifo_lengths.clone()))
+            return state, chunk_preds
+
+        sortformer_model.sortformer_modules.streaming_update_async = capture_streaming_update
+        with torch.no_grad():
+            sortformer_model(torch.randn(2, 16000), torch.tensor([16000, 5000]))
+
+        assert updates
+        finalized_masks = []
+        for finalized, fifo_lengths in updates:
+            finalized_masks.append(finalized)
+            assert torch.count_nonzero(fifo_lengths[finalized]) == 0
+        assert torch.stack(finalized_masks)[:, 1].any()
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("streaming_mode", [False, True])
     def test_spec_augment_is_applied_once_in_forward(self, sortformer_model, streaming_mode):
         sortformer_model.streaming_mode = streaming_mode
@@ -328,6 +418,39 @@ class TestSortformerEncLabelModelStreaming:
 
 
 class TestSortformerEncLabelModelHighResolution:
+    @pytest.mark.unit
+    def test_async_high_resolution_chunk_extraction_is_vectorized_and_profiled(self):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        batch_size, max_chunk_len, num_speakers, lc_enc = 3, 3, 2, 1
+        upsample_factor = model.upsample_factor
+        high_resolution_preds = torch.arange(
+            batch_size * 10 * upsample_factor * num_speakers, dtype=torch.float32
+        ).reshape(batch_size, 10 * upsample_factor, num_speakers)
+        spkcache_lengths = torch.tensor([0, 2, 4])
+        fifo_lengths = torch.tensor([1, 3, 0])
+        chunk_lengths = torch.tensor([3, 1, 0])
+        expected = high_resolution_preds.new_zeros((batch_size, max_chunk_len * upsample_factor, num_speakers))
+        for batch_idx in range(batch_size):
+            start = (spkcache_lengths[batch_idx] + fifo_lengths[batch_idx] + lc_enc) * upsample_factor
+            length = chunk_lengths[batch_idx] * upsample_factor
+            expected[batch_idx, :length] = high_resolution_preds[batch_idx, start : start + length]
+        profiler = InferenceProfiler(model)
+        profiler.install()
+
+        actual = model._extract_async_high_resolution_chunk_preds(
+            high_resolution_preds=high_resolution_preds,
+            spkcache_lengths=spkcache_lengths,
+            fifo_lengths=fifo_lengths,
+            chunk_lengths=chunk_lengths,
+            max_chunk_len=max_chunk_len,
+            lc_enc=lc_enc,
+        )
+
+        torch.testing.assert_close(actual, expected)
+        assert actual.is_contiguous()
+        assert profiler.section_calls["high_resolution_extract"] == 1
+        assert profiler.section_times["high_resolution_extract"] > 0
+
     @pytest.mark.unit
     def test_non_strict_warm_start_from_legacy_state_dict(self):
         low_resolution_model = _create_sortformer_model().eval()
