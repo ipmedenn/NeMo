@@ -416,17 +416,26 @@ class SortformerModules(NeuralModule, Exportable):
         total_lengths = torch.sum(torch.stack(lengths), dim=0)
         sig_length = total_lengths.max().item()
 
-        output = torch.zeros(batch_size, sig_length, emb_dim, device=device, dtype=dtype)
+        # Reserve one extra position as the destination for invalid/padded source frames.
+        # This keeps all indexing tensors rectangular and avoids a Python loop over the batch.
+        flat_output = torch.zeros(batch_size * sig_length + 1, emb_dim, device=device, dtype=dtype)
         start_indices = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        batch_offsets = torch.arange(batch_size, dtype=torch.long, device=device).unsqueeze(1) * sig_length
+        padding_index = torch.tensor(batch_size * sig_length, dtype=torch.long, device=device)
 
         for emb, length in zip(embs, lengths):
-            end_indices = start_indices + length
-            for batch_idx in range(batch_size):
-                output[batch_idx, start_indices[batch_idx] : end_indices[batch_idx]] = emb[
-                    batch_idx, : length[batch_idx]
-                ]
-            start_indices = end_indices
+            source_indices = torch.arange(emb.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+            valid_mask = source_indices < length.unsqueeze(1)
+            flat_destination_indices = torch.where(
+                valid_mask,
+                batch_offsets + start_indices.unsqueeze(1) + source_indices,
+                padding_index,
+            ).reshape(-1)
+            flat_source = emb.reshape(-1, emb_dim).type_as(flat_output)
+            flat_output.index_copy_(0, flat_destination_indices, flat_source)
+            start_indices += length
 
+        output = flat_output[: batch_size * sig_length].view(batch_size, sig_length, emb_dim)
         return output, total_lengths
 
     def init_streaming_state(self, batch_size: int = 1, async_streaming: bool = False, device: torch.device = None):
@@ -510,82 +519,155 @@ class SortformerModules(NeuralModule, Exportable):
         max_pop_out_len = max(self.spkcache_update_period, max_chunk_len)
         max_pop_out_len = min(max_pop_out_len, max_chunk_len + max_fifo_len)
 
-        streaming_state.fifo_preds = torch.zeros((batch_size, max_fifo_len, n_spk), device=preds.device)
-        chunk_preds = torch.zeros((batch_size, max_chunk_len, n_spk), device=preds.device)
+        spkcache_lengths = streaming_state.spkcache_lengths
+        fifo_lengths = streaming_state.fifo_lengths
         chunk_lengths = (chunk_lengths - lc).clamp(min=0, max=max_chunk_len)
-        updated_fifo = torch.zeros((batch_size, max_fifo_len + max_chunk_len, emb_dim), device=preds.device)
-        updated_fifo_preds = torch.zeros((batch_size, max_fifo_len + max_chunk_len, n_spk), device=preds.device)
-        updated_spkcache = torch.zeros((batch_size, max_spkcache_len + max_pop_out_len, emb_dim), device=preds.device)
-        # Negative predictions mark an unseeded cache so its first compression uses the current forward's predictions.
-        updated_spkcache_preds = torch.full(
-            (batch_size, max_spkcache_len + max_pop_out_len, n_spk), -1.0, device=preds.device
+
+        # Extract current predictions for all state regions with one rectangular gather.
+        spkcache_positions = torch.arange(max_spkcache_len, device=preds.device).unsqueeze(0)
+        fifo_positions = torch.arange(max_fifo_len, device=preds.device).unsqueeze(0)
+        chunk_positions = torch.arange(max_chunk_len, device=preds.device).unsqueeze(0)
+        spkcache_pred_indices = spkcache_positions.expand(batch_size, -1)
+        fifo_pred_indices = spkcache_lengths.unsqueeze(1) + fifo_positions
+        chunk_pred_indices = spkcache_lengths.unsqueeze(1) + fifo_lengths.unsqueeze(1) + lc + chunk_positions
+        valid_spkcache_preds = spkcache_positions < spkcache_lengths.unsqueeze(1)
+        valid_fifo_preds = fifo_positions < fifo_lengths.unsqueeze(1)
+        valid_chunk_preds = chunk_positions < chunk_lengths.unsqueeze(1)
+        pred_indices = torch.cat([spkcache_pred_indices, fifo_pred_indices, chunk_pred_indices], dim=1)
+        valid_pred_indices = torch.cat([valid_spkcache_preds, valid_fifo_preds, valid_chunk_preds], dim=1)
+        pred_padding_index = preds.shape[1]
+        pred_indices = torch.where(valid_pred_indices, pred_indices, pred_padding_index)
+        padded_preds = torch.cat([preds, preds.new_zeros((batch_size, 1, n_spk))], dim=1)
+        gathered_preds = torch.gather(padded_preds, 1, pred_indices.unsqueeze(-1).expand(-1, -1, n_spk))
+        gathered_preds = gathered_preds.type_as(streaming_state.spkcache_preds)
+        current_spkcache_preds, current_fifo_preds, chunk_preds = torch.split(
+            gathered_preds, [max_spkcache_len, max_fifo_len, max_chunk_len], dim=1
         )
 
-        for batch_index in range(batch_size):
-            spkcache_len = streaming_state.spkcache_lengths[batch_index].item()
-            fifo_len = streaming_state.fifo_lengths[batch_index].item()
-            chunk_len = chunk_lengths[batch_index].item()
-            streaming_state.fifo_preds[batch_index, :fifo_len, :] = preds[
-                batch_index, spkcache_len : spkcache_len + fifo_len, :
-            ]
-            chunk_preds[batch_index, :chunk_len, :] = preds[
-                batch_index, spkcache_len + fifo_len + lc : spkcache_len + fifo_len + lc + chunk_len
-            ]
-            updated_spkcache[batch_index, :spkcache_len, :] = streaming_state.spkcache[batch_index, :spkcache_len, :]
-            updated_spkcache_preds[batch_index, :spkcache_len, :] = streaming_state.spkcache_preds[
-                batch_index, :spkcache_len, :
-            ]
-            updated_fifo[batch_index, :fifo_len, :] = streaming_state.fifo[batch_index, :fifo_len, :]
-            updated_fifo_preds[batch_index, :fifo_len, :] = streaming_state.fifo_preds[batch_index, :fifo_len, :]
+        # Compute each row's FIFO pop and retained lengths without synchronizing values to Python.
+        combined_fifo_lengths = fifo_lengths + chunk_lengths
+        overflow_lengths = combined_fifo_lengths - max_fifo_len
+        update_period = torch.full_like(combined_fifo_lengths, self.spkcache_update_period)
+        pop_out_lengths = torch.where(
+            combined_fifo_lengths > max_fifo_len,
+            torch.minimum(combined_fifo_lengths, torch.maximum(update_period, overflow_lengths)),
+            torch.zeros_like(combined_fifo_lengths),
+        )
+        new_fifo_lengths = combined_fifo_lengths - pop_out_lengths
 
-            # append chunk to fifo
-            streaming_state.fifo_lengths[batch_index] += chunk_len
-            updated_fifo[batch_index, fifo_len : fifo_len + chunk_len, :] = chunk[batch_index, lc : lc + chunk_len, :]
-            updated_fifo_preds[batch_index, fifo_len : fifo_len + chunk_len, :] = chunk_preds[
-                batch_index, :chunk_len, :
-            ]
-            if fifo_len + chunk_len > max_fifo_len:
-                # move pop_out_len first frames of FIFO queue to speaker cache
-                pop_out_len = self.spkcache_update_period
-                pop_out_len = max(pop_out_len, chunk_len - max_fifo_len + fifo_len)
-                pop_out_len = min(pop_out_len, fifo_len + chunk_len)
-                streaming_state.spkcache_lengths[batch_index] += pop_out_len
-                pop_out_embs = updated_fifo[batch_index, :pop_out_len, :]
-                pop_out_preds = updated_fifo_preds[batch_index, :pop_out_len, :]
-                if not self.use_learnable_sil_emb:
-                    (
-                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                    ) = self._get_silence_profile(
-                        streaming_state.mean_sil_emb[batch_index : batch_index + 1],
-                        streaming_state.n_sil_frames[batch_index : batch_index + 1],
-                        pop_out_embs.unsqueeze(0),
-                        pop_out_preds.unsqueeze(0),
-                    )
-                updated_spkcache[batch_index, spkcache_len : spkcache_len + pop_out_len, :] = pop_out_embs
-                if updated_spkcache_preds[batch_index, 0, 0] >= 0:
-                    # speaker cache already compressed at least once
-                    updated_spkcache_preds[batch_index, spkcache_len : spkcache_len + pop_out_len, :] = pop_out_preds
-                elif spkcache_len + pop_out_len > self.spkcache_len:
-                    # will compress speaker cache for the first time
-                    updated_spkcache_preds[batch_index, :spkcache_len, :] = preds[batch_index, :spkcache_len, :]
-                    updated_spkcache_preds[batch_index, spkcache_len : spkcache_len + pop_out_len, :] = pop_out_preds
-                streaming_state.fifo_lengths[batch_index] -= pop_out_len
-                new_fifo_len = streaming_state.fifo_lengths[batch_index].item()
-                updated_fifo[batch_index, :new_fifo_len, :] = updated_fifo[
-                    batch_index, pop_out_len : pop_out_len + new_fifo_len, :
-                ].clone()
-                updated_fifo_preds[batch_index, :new_fifo_len, :] = updated_fifo_preds[
-                    batch_index, pop_out_len : pop_out_len + new_fifo_len, :
-                ].clone()
-                updated_fifo[batch_index, new_fifo_len:, :] = 0
-                updated_fifo_preds[batch_index, new_fifo_len:, :] = 0
+        # Treat the old FIFO and current chunk as a per-row logical concatenation. Gather both
+        # the popped prefix and retained suffix in one operation while keeping the state left-aligned.
+        update_chunk = chunk[:, lc : lc + max_chunk_len].type_as(streaming_state.fifo)
+        fifo_chunk_embs = torch.cat(
+            [
+                streaming_state.fifo,
+                update_chunk,
+                streaming_state.fifo.new_zeros((batch_size, 1, emb_dim)),
+            ],
+            dim=1,
+        )
+        fifo_chunk_preds = torch.cat(
+            [
+                current_fifo_preds,
+                chunk_preds,
+                current_fifo_preds.new_zeros((batch_size, 1, n_spk)),
+            ],
+            dim=1,
+        )
+        pop_positions = torch.arange(max_pop_out_len, device=preds.device).unsqueeze(0)
+        retained_positions = torch.arange(max_fifo_len, device=preds.device).unsqueeze(0)
+        pop_logical_indices = pop_positions.expand(batch_size, -1)
+        retained_logical_indices = pop_out_lengths.unsqueeze(1) + retained_positions
+        fifo_logical_indices = torch.cat([pop_logical_indices, retained_logical_indices], dim=1)
+        valid_fifo_logical_indices = torch.cat(
+            [
+                pop_positions < pop_out_lengths.unsqueeze(1),
+                retained_positions < new_fifo_lengths.unsqueeze(1),
+            ],
+            dim=1,
+        )
+        fifo_physical_indices = torch.where(
+            fifo_logical_indices < fifo_lengths.unsqueeze(1),
+            fifo_logical_indices,
+            max_fifo_len + fifo_logical_indices - fifo_lengths.unsqueeze(1),
+        )
+        fifo_padding_index = max_fifo_len + max_chunk_len
+        fifo_physical_indices = torch.where(valid_fifo_logical_indices, fifo_physical_indices, fifo_padding_index)
+        gathered_fifo_embs = torch.gather(
+            fifo_chunk_embs, 1, fifo_physical_indices.unsqueeze(-1).expand(-1, -1, emb_dim)
+        )
+        gathered_fifo_preds = torch.gather(
+            fifo_chunk_preds, 1, fifo_physical_indices.unsqueeze(-1).expand(-1, -1, n_spk)
+        )
+        pop_out_embs, updated_fifo = torch.split(gathered_fifo_embs, [max_pop_out_len, max_fifo_len], dim=1)
+        pop_out_preds, updated_fifo_preds = torch.split(gathered_fifo_preds, [max_pop_out_len, max_fifo_len], dim=1)
+        valid_pop_mask = pop_positions < pop_out_lengths.unsqueeze(1)
 
-        streaming_state.fifo = updated_fifo[:, :max_fifo_len, :]
-        streaming_state.fifo_preds = updated_fifo_preds[:, :max_fifo_len, :]
+        if not self.use_learnable_sil_emb:
+            is_sil = (pop_out_preds.sum(dim=2) < self.sil_threshold) & valid_pop_mask
+            sil_count = is_sil.sum(dim=1)
+            updated_n_sil_frames = streaming_state.n_sil_frames + sil_count
+            sil_emb_sum = torch.sum(pop_out_embs * is_sil.unsqueeze(-1), dim=1)
+            old_sil_emb_sum = streaming_state.mean_sil_emb * streaming_state.n_sil_frames.unsqueeze(1)
+            updated_mean_sil_emb = (old_sil_emb_sum + sil_emb_sum) / torch.clamp(
+                updated_n_sil_frames.unsqueeze(1), min=1
+            )
+            updated_mean_sil_emb = torch.where(
+                (sil_count > 0).unsqueeze(1), updated_mean_sil_emb, streaming_state.mean_sil_emb
+            )
+            streaming_state.mean_sil_emb.copy_(updated_mean_sil_emb)
+            streaming_state.n_sil_frames.copy_(updated_n_sil_frames)
 
-        # update speaker cache
-        need_compress = streaming_state.spkcache_lengths > self.spkcache_len
+        # Build the compression candidates as [valid cache | popped FIFO] for every row.
+        updated_spkcache_lengths = spkcache_lengths + pop_out_lengths
+        need_compress = updated_spkcache_lengths > self.spkcache_len
+        spkcache_seeded = (spkcache_lengths > 0) & (streaming_state.spkcache_preds[:, 0, 0] >= 0)
+        first_compression = (~spkcache_seeded) & need_compress
+        candidate_old_preds = torch.where(
+            first_compression.view(-1, 1, 1), current_spkcache_preds, streaming_state.spkcache_preds
+        )
+        write_pop_preds = spkcache_seeded | first_compression
+        candidate_pop_preds = torch.where(
+            write_pop_preds.view(-1, 1, 1), pop_out_preds, torch.full_like(pop_out_preds, -1.0)
+        )
+        candidate_spkcache_embs = torch.cat(
+            [
+                streaming_state.spkcache,
+                pop_out_embs,
+                streaming_state.spkcache.new_zeros((batch_size, 1, emb_dim)),
+            ],
+            dim=1,
+        )
+        candidate_spkcache_preds = torch.cat(
+            [
+                candidate_old_preds,
+                candidate_pop_preds,
+                streaming_state.spkcache_preds.new_full((batch_size, 1, n_spk), -1.0),
+            ],
+            dim=1,
+        )
+        candidate_positions = torch.arange(max_spkcache_len + max_pop_out_len, device=preds.device).unsqueeze(0)
+        candidate_logical_indices = candidate_positions.expand(batch_size, -1)
+        valid_candidate_indices = candidate_positions < updated_spkcache_lengths.unsqueeze(1)
+        candidate_physical_indices = torch.where(
+            candidate_logical_indices < spkcache_lengths.unsqueeze(1),
+            candidate_logical_indices,
+            max_spkcache_len + candidate_logical_indices - spkcache_lengths.unsqueeze(1),
+        )
+        candidate_padding_index = max_spkcache_len + max_pop_out_len
+        candidate_physical_indices = torch.where(
+            valid_candidate_indices, candidate_physical_indices, candidate_padding_index
+        )
+        updated_spkcache = torch.gather(
+            candidate_spkcache_embs, 1, candidate_physical_indices.unsqueeze(-1).expand(-1, -1, emb_dim)
+        )
+        updated_spkcache_preds = torch.gather(
+            candidate_spkcache_preds, 1, candidate_physical_indices.unsqueeze(-1).expand(-1, -1, n_spk)
+        )
+
+        streaming_state.fifo = updated_fifo
+        streaming_state.fifo_preds = updated_fifo_preds
+        streaming_state.fifo_lengths.copy_(new_fifo_lengths)
         streaming_state.spkcache = updated_spkcache[:, : self.spkcache_len, :]
         streaming_state.spkcache_preds = updated_spkcache_preds[:, : self.spkcache_len, :]
 
@@ -597,7 +679,7 @@ class SortformerModules(NeuralModule, Exportable):
                 mean_sil_emb=streaming_state.mean_sil_emb[idx],
                 permute_spk=False,
             )
-            streaming_state.spkcache_lengths[idx] = streaming_state.spkcache_lengths[idx].clamp(max=self.spkcache_len)
+        streaming_state.spkcache_lengths.copy_(updated_spkcache_lengths.clamp(max=self.spkcache_len))
 
         if self.log:
             logging.info(
