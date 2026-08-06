@@ -515,8 +515,15 @@ class TestSortformerModules_StreamingUtils:
         for batch_idx in range(batch_size):
             assert torch.count_nonzero(fixed_output[batch_idx, fixed_lengths[batch_idx] :]) == 0
 
+        full_lengths = [torch.full((batch_size,), emb.shape[1], dtype=torch.long) for emb in embs]
+        full_output, full_total_lengths = SortformerModules.concat_and_pad(embs, full_lengths, output_length=9)
+        assert full_output.shape == fixed_output.shape
+        torch.testing.assert_close(full_total_lengths, torch.full((batch_size,), 9, dtype=torch.long))
+        for batch_idx in range(batch_size):
+            torch.testing.assert_close(full_output[batch_idx], torch.cat([emb[batch_idx] for emb in embs]))
+
         with pytest.raises(ValueError, match="output_length"):
-            SortformerModules.concat_and_pad(embs, lengths, output_length=4)
+            SortformerModules.concat_and_pad(embs, lengths, output_length=8)
 
         empty_output, empty_lengths = SortformerModules.concat_and_pad(
             embs, [torch.zeros(batch_size, dtype=torch.long) for _ in embs]

@@ -398,7 +398,7 @@ class SortformerModules(NeuralModule, Exportable):
         Args:
             embs: List of embeddings Tensors of (batch_size, n_frames, emb_dim) shape
             lengths: List of lengths Tensors of (batch_size,) shape
-            output_length: Optional fixed output width. It must fit every row's valid concatenated frames.
+            output_length: Optional fixed output width. It must fit the full physical capacity of all input tensors.
 
         Returns:
             output: concatenated embeddings Tensor of (batch_size, n_frames, emb_dim) shape
@@ -420,12 +420,15 @@ class SortformerModules(NeuralModule, Exportable):
         batch_size, emb_dim = embs[0].shape[0], embs[0].shape[2]
 
         total_lengths = torch.sum(torch.stack(lengths), dim=0)
-        required_length = total_lengths.max().item()
-        if output_length is not None and output_length < required_length:
-            raise ValueError(
-                f"output_length ({output_length}) must be at least the maximum total length ({required_length})."
-            )
-        sig_length = required_length if output_length is None else output_length
+        if output_length is None:
+            sig_length = total_lengths.max().item()
+        else:
+            input_capacity = sum(emb.shape[1] for emb in embs)
+            if isinstance(output_length, int) and isinstance(input_capacity, int) and output_length < input_capacity:
+                raise ValueError(
+                    f"output_length ({output_length}) must be at least the total input capacity ({input_capacity})."
+                )
+            sig_length = output_length
 
         # Reserve one extra position as the destination for invalid/padded source frames.
         # This keeps all indexing tensors rectangular and avoids a Python loop over the batch.
