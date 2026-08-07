@@ -463,23 +463,41 @@ def test_pe_encoder_builds_and_wires_both_real_encoders():
 
 
 @pytest.mark.unit
-def test_pe_encoder_matches_diar_output_resolution_to_asr_encoder():
+@pytest.mark.parametrize(
+    "high_resolution, requested_diar_subsampling_factor, expected_asr_aligned_factor",
+    [(True, 1, _SUBSAMPLING_FACTOR)],
+)
+def test_pe_encoder_matches_diar_output_resolution_to_asr_encoder(
+    high_resolution, requested_diar_subsampling_factor, expected_asr_aligned_factor
+):
     diar_cfg = toy_diarization_model_cfg()
-    diar_cfg.high_resolution = True
-    diar_cfg.output_subsampling_factor = 1
+    diar_cfg.high_resolution = high_resolution
+    diar_cfg.output_subsampling_factor = requested_diar_subsampling_factor
 
     enc = build_toy_pe_encoder(diarization_model_cfg=diar_cfg)
 
-    assert enc.diarization_model.output_subsampling_factor == enc.asr_encoder.subsampling_factor
-    assert enc.diarization_model._cfg.output_subsampling_factor == enc.asr_encoder.subsampling_factor
+    assert (
+        enc.diarization_model.output_subsampling_factor
+        == enc.asr_encoder.subsampling_factor
+        == expected_asr_aligned_factor
+    )
+    assert (
+        enc.diarization_model._cfg.output_subsampling_factor
+        == enc.asr_encoder.subsampling_factor
+        == expected_asr_aligned_factor
+    )
 
 
 @pytest.mark.unit
-def test_pe_encoder_rejects_incompatible_diar_output_resolution():
+@pytest.mark.parametrize(
+    "asr_subsampling_factor, error_match",
+    [(4, "requires the diarization output subsampling factor")],
+)
+def test_pe_encoder_rejects_incompatible_diar_output_resolution(asr_subsampling_factor, error_match):
     asr_cfg = toy_asr_encoder_cfg()
-    asr_cfg.subsampling_factor = 4
+    asr_cfg.subsampling_factor = asr_subsampling_factor
 
-    with pytest.raises(ValueError, match="requires the diarization output subsampling factor"):
+    with pytest.raises(ValueError, match=error_match):
         build_toy_pe_encoder(asr_encoder_cfg=asr_cfg)
 
 

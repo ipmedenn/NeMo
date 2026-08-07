@@ -268,65 +268,107 @@ class TestSortformerEncLabelModelStreaming:
         assert isinstance(instance2, SortformerEncLabelModel)
 
     @pytest.mark.unit
-    def test_call_pre_encode_with_feature_stacking(self, sortformer_model):
+    @pytest.mark.parametrize(
+        "stacking_factor, feature_shape, input_lengths, expected_encoded_lengths",
+        [(8, (2, 120, 80), (120, 91), (15, 12))],
+    )
+    def test_call_pre_encode_with_feature_stacking(
+        self, sortformer_model, stacking_factor, feature_shape, input_lengths, expected_encoded_lengths
+    ):
         sortformer_model.encoder.pre_encode = FeatureStacking(
-            subsampling_factor=8,
-            feat_in=80,
+            subsampling_factor=stacking_factor,
+            feat_in=feature_shape[-1],
             feat_out=sortformer_model._cfg.model_defaults.fc_d_model,
         )
-        features = torch.randn(2, 120, 80)
-        lengths = torch.tensor([120, 91])
+        features = torch.randn(feature_shape)
+        lengths = torch.tensor(input_lengths)
 
         encoded, encoded_lengths = sortformer_model._call_pre_encode(features, lengths)
 
-        assert encoded.shape == (2, 15, sortformer_model._cfg.model_defaults.fc_d_model)
-        assert torch.equal(encoded_lengths, torch.tensor([15, 12]))
+        assert encoded.shape == (
+            feature_shape[0],
+            max(expected_encoded_lengths),
+            sortformer_model._cfg.model_defaults.fc_d_model,
+        )
+        assert torch.equal(encoded_lengths, torch.tensor(expected_encoded_lengths))
 
     @pytest.mark.unit
-    def test_streaming_input_examples_match_model_dimensions(self, sortformer_model):
-        sortformer_model.sortformer_modules.spkcache_len = 5
-        sortformer_model.sortformer_modules.fifo_len = 7
-        sortformer_model.sortformer_modules.chunk_len = 3
-        sortformer_model.sortformer_modules.chunk_left_context = 1
-        sortformer_model.sortformer_modules.chunk_right_context = 2
+    @pytest.mark.parametrize(
+        (
+            "batch_size, spkcache_len, fifo_len, chunk_len, chunk_left_context, chunk_right_context, "
+            "expected_chunk_frames, expected_pre_encode_frames"
+        ),
+        [(2, 5, 7, 3, 1, 2, 48, 6)],
+    )
+    def test_streaming_input_examples_match_model_dimensions(
+        self,
+        sortformer_model,
+        batch_size,
+        spkcache_len,
+        fifo_len,
+        chunk_len,
+        chunk_left_context,
+        chunk_right_context,
+        expected_chunk_frames,
+        expected_pre_encode_frames,
+    ):
+        sortformer_model.sortformer_modules.spkcache_len = spkcache_len
+        sortformer_model.sortformer_modules.fifo_len = fifo_len
+        sortformer_model.sortformer_modules.chunk_len = chunk_len
+        sortformer_model.sortformer_modules.chunk_left_context = chunk_left_context
+        sortformer_model.sortformer_modules.chunk_right_context = chunk_right_context
 
         chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths = (
-            sortformer_model.streaming_input_examples(batch_size=2)
+            sortformer_model.streaming_input_examples(batch_size=batch_size)
         )
 
-        chunk_frames = (1 + 3 + 2) * sortformer_model.encoder.subsampling_factor
-        assert chunk.shape == (2, chunk_frames, sortformer_model.encoder._feat_in)
-        assert chunk_lengths.tolist() == [chunk_frames, chunk_frames]
-        assert spkcache.shape == (2, 5, sortformer_model.sortformer_modules.fc_d_model)
-        assert fifo.shape == (2, 7, sortformer_model.sortformer_modules.fc_d_model)
+        chunk_frames = (
+            chunk_left_context + chunk_len + chunk_right_context
+        ) * sortformer_model.encoder.subsampling_factor
+        assert chunk_frames == expected_chunk_frames
+        assert chunk.shape == (batch_size, chunk_frames, sortformer_model.encoder._feat_in)
+        assert chunk_lengths.tolist() == [chunk_frames] * batch_size
+        assert spkcache.shape == (batch_size, spkcache_len, sortformer_model.sortformer_modules.fc_d_model)
+        assert fifo.shape == (batch_size, fifo_len, sortformer_model.sortformer_modules.fc_d_model)
         assert torch.all(spkcache_lengths <= spkcache.shape[1])
         assert torch.all(fifo_lengths <= fifo.shape[1])
         with torch.no_grad():
             chunk_pre_encode_embs, chunk_pre_encode_lengths = sortformer_model._call_pre_encode(chunk, chunk_lengths)
-        assert chunk_pre_encode_embs.shape[1] == 1 + 3 + 2
-        assert chunk_pre_encode_lengths.tolist() == [1 + 3 + 2, 1 + 3 + 2]
+        pre_encode_frames = chunk_left_context + chunk_len + chunk_right_context
+        assert pre_encode_frames == expected_pre_encode_frames
+        assert chunk_pre_encode_embs.shape[1] == pre_encode_frames
+        assert chunk_pre_encode_lengths.tolist() == [pre_encode_frames] * batch_size
 
     @pytest.mark.unit
-    def test_streaming_export_accepts_explicit_input_example(self, sortformer_model):
+    @pytest.mark.parametrize("output_filename, mocked_export_result", [("model.onnx", "exported")])
+    def test_streaming_export_accepts_explicit_input_example(
+        self, sortformer_model, output_filename, mocked_export_result
+    ):
         input_example = tuple(torch.empty(0) for _ in sortformer_model.input_names)
-        with patch.object(sortformer_model, "export", return_value="exported") as export_mock:
-            result = sortformer_model.streaming_export("model.onnx", input_example=input_example)
+        with patch.object(sortformer_model, "export", return_value=mocked_export_result) as export_mock:
+            result = sortformer_model.streaming_export(output_filename, input_example=input_example)
 
-        assert result == "exported"
-        export_mock.assert_called_once_with("model.onnx", input_example=input_example)
+        assert result == mocked_export_result
+        export_mock.assert_called_once_with(output_filename, input_example=input_example)
 
     @pytest.mark.unit
-    def test_streaming_export_uses_model_sized_defaults(self, sortformer_model):
+    @pytest.mark.parametrize(
+        "output_filename, batch_size, mocked_export_result",
+        [("model.onnx", 2, "exported")],
+    )
+    def test_streaming_export_uses_model_sized_defaults(
+        self, sortformer_model, output_filename, batch_size, mocked_export_result
+    ):
         input_example = tuple(torch.empty(0) for _ in sortformer_model.input_names)
         with (
             patch.object(sortformer_model, "streaming_input_examples", return_value=input_example) as examples_mock,
-            patch.object(sortformer_model, "export", return_value="exported") as export_mock,
+            patch.object(sortformer_model, "export", return_value=mocked_export_result) as export_mock,
         ):
-            result = sortformer_model.streaming_export("model.onnx", batch_size=2)
+            result = sortformer_model.streaming_export(output_filename, batch_size=batch_size)
 
-        assert result == "exported"
-        examples_mock.assert_called_once_with(batch_size=2)
-        export_mock.assert_called_once_with("model.onnx", input_example=input_example)
+        assert result == mocked_export_result
+        examples_mock.assert_called_once_with(batch_size=batch_size)
+        export_mock.assert_called_once_with(output_filename, input_example=input_example)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("async_streaming", [False, True])
@@ -357,18 +399,35 @@ class TestSortformerEncLabelModelStreaming:
         assert all(profiler.section_calls[section] > 0 for section in expected_sections)
 
     @pytest.mark.unit
-    def test_async_streaming_can_pad_encoder_input_to_max_length(self, sortformer_model):
+    @pytest.mark.parametrize(
+        (
+            "batch_size, spkcache_len, fifo_len, chunk_len, chunk_left_context, chunk_right_context, "
+            "processed_signal_lengths, expected_frontend_shape"
+        ),
+        [(2, 5, 7, 3, 1, 2, (48, 24), (2, 18, 32))],
+    )
+    def test_async_streaming_can_pad_encoder_input_to_max_length(
+        self,
+        sortformer_model,
+        batch_size,
+        spkcache_len,
+        fifo_len,
+        chunk_len,
+        chunk_left_context,
+        chunk_right_context,
+        processed_signal_lengths,
+        expected_frontend_shape,
+    ):
         sortformer_model.streaming_mode = True
         sortformer_model.async_streaming = True
         sortformer_model.async_pad_to_max = True
-        sortformer_model.sortformer_modules.spkcache_len = 5
-        sortformer_model.sortformer_modules.fifo_len = 7
-        sortformer_model.sortformer_modules.chunk_len = 3
-        sortformer_model.sortformer_modules.chunk_left_context = 1
-        sortformer_model.sortformer_modules.chunk_right_context = 2
+        sortformer_model.sortformer_modules.spkcache_len = spkcache_len
+        sortformer_model.sortformer_modules.fifo_len = fifo_len
+        sortformer_model.sortformer_modules.chunk_len = chunk_len
+        sortformer_model.sortformer_modules.chunk_left_context = chunk_left_context
+        sortformer_model.sortformer_modules.chunk_right_context = chunk_right_context
         sortformer_model.eval()
 
-        batch_size = 2
         streaming_state = sortformer_model.sortformer_modules.init_streaming_state(
             batch_size=batch_size, async_streaming=True
         )
@@ -382,19 +441,27 @@ class TestSortformerEncLabelModelStreaming:
         sortformer_model.frontend_encoder = capture_frontend_input
         with torch.no_grad():
             sortformer_model.forward_streaming_step(
-                processed_signal=torch.randn(batch_size, 48, 80),
-                processed_signal_length=torch.tensor([48, 24]),
+                processed_signal=torch.randn(
+                    batch_size, max(processed_signal_lengths), sortformer_model.encoder._feat_in
+                ),
+                processed_signal_length=torch.tensor(processed_signal_lengths),
                 streaming_state=streaming_state,
                 total_preds=torch.zeros(batch_size, 0, sortformer_model._cfg.max_num_of_spks),
             )
 
-        assert frontend_inputs == [torch.Size([batch_size, 18, 32])]
+        assert frontend_inputs == [torch.Size(expected_frontend_shape)]
 
     @pytest.mark.unit
-    def test_async_streaming_flushes_fifo_for_finalized_rows(self, sortformer_model):
+    @pytest.mark.parametrize(
+        "chunk_len, audio_shape, audio_lengths",
+        [(6, (2, 16000), (16000, 5000))],
+    )
+    def test_async_streaming_flushes_fifo_for_finalized_rows(
+        self, sortformer_model, chunk_len, audio_shape, audio_lengths
+    ):
         sortformer_model.streaming_mode = True
         sortformer_model.async_streaming = True
-        sortformer_model.sortformer_modules.chunk_len = 6
+        sortformer_model.sortformer_modules.chunk_len = chunk_len
         sortformer_model.eval()
         streaming_update_async = sortformer_model.sortformer_modules.streaming_update_async
         updates = []
@@ -408,7 +475,7 @@ class TestSortformerEncLabelModelStreaming:
 
         sortformer_model.sortformer_modules.streaming_update_async = capture_streaming_update
         with torch.no_grad():
-            sortformer_model(torch.randn(2, 16000), torch.tensor([16000, 5000]))
+            sortformer_model(torch.randn(audio_shape), torch.tensor(audio_lengths))
 
         assert updates
         finalized_masks = []
@@ -468,19 +535,31 @@ class TestSortformerEncLabelModelStreaming:
 
 class TestSortformerEncLabelModelHighResolution:
     @pytest.mark.unit
-    def test_async_high_resolution_chunk_extraction_is_vectorized_and_profiled(self):
+    @pytest.mark.parametrize(
+        ("batch_size, max_chunk_len, num_speakers, left_context, spkcache_lengths, fifo_lengths, " "chunk_lengths"),
+        [(3, 3, 2, 1, (0, 2, 4), (1, 3, 0), (3, 1, 0))],
+    )
+    def test_async_high_resolution_chunk_extraction_is_vectorized_and_profiled(
+        self,
+        batch_size,
+        max_chunk_len,
+        num_speakers,
+        left_context,
+        spkcache_lengths,
+        fifo_lengths,
+        chunk_lengths,
+    ):
         model = _create_sortformer_model(high_resolution=True).eval()
-        batch_size, max_chunk_len, num_speakers, lc_enc = 3, 3, 2, 1
         upsample_factor = model.upsample_factor
         high_resolution_preds = torch.arange(
             batch_size * 10 * upsample_factor * num_speakers, dtype=torch.float32
         ).reshape(batch_size, 10 * upsample_factor, num_speakers)
-        spkcache_lengths = torch.tensor([0, 2, 4])
-        fifo_lengths = torch.tensor([1, 3, 0])
-        chunk_lengths = torch.tensor([3, 1, 0])
+        spkcache_lengths = torch.tensor(spkcache_lengths)
+        fifo_lengths = torch.tensor(fifo_lengths)
+        chunk_lengths = torch.tensor(chunk_lengths)
         expected = high_resolution_preds.new_zeros((batch_size, max_chunk_len * upsample_factor, num_speakers))
         for batch_idx in range(batch_size):
-            start = (spkcache_lengths[batch_idx] + fifo_lengths[batch_idx] + lc_enc) * upsample_factor
+            start = (spkcache_lengths[batch_idx] + fifo_lengths[batch_idx] + left_context) * upsample_factor
             length = chunk_lengths[batch_idx] * upsample_factor
             expected[batch_idx, :length] = high_resolution_preds[batch_idx, start : start + length]
         profiler = InferenceProfiler(model)
@@ -492,7 +571,7 @@ class TestSortformerEncLabelModelHighResolution:
             fifo_lengths=fifo_lengths,
             chunk_lengths=chunk_lengths,
             max_chunk_len=max_chunk_len,
-            lc_enc=lc_enc,
+            lc_enc=left_context,
         )
 
         torch.testing.assert_close(actual, expected)
@@ -501,13 +580,23 @@ class TestSortformerEncLabelModelHighResolution:
         assert profiler.section_times["high_resolution_extract"] > 0
 
     @pytest.mark.unit
-    def test_non_strict_warm_start_from_legacy_state_dict(self):
+    @pytest.mark.parametrize(
+        "embedding_batch_size, embedding_frame_count, embedding_lengths",
+        [(2, 5, (5, 4))],
+    )
+    def test_non_strict_warm_start_from_legacy_state_dict(
+        self, embedding_batch_size, embedding_frame_count, embedding_lengths
+    ):
         low_resolution_model = _create_sortformer_model().eval()
         high_resolution_model = _create_sortformer_model(high_resolution=True).eval()
 
         load_result = high_resolution_model.load_state_dict(low_resolution_model.state_dict(), strict=False)
-        emb_seq = torch.randn(2, 5, low_resolution_model._cfg.model_defaults.tf_d_model)
-        emb_seq_length = torch.tensor([5, 4])
+        emb_seq = torch.randn(
+            embedding_batch_size,
+            embedding_frame_count,
+            low_resolution_model._cfg.model_defaults.tf_d_model,
+        )
+        emb_seq_length = torch.tensor(embedding_lengths)
         with torch.no_grad():
             low_resolution_preds = low_resolution_model.forward_infer(emb_seq, emb_seq_length)
             high_resolution_preds = high_resolution_model.forward_infer(emb_seq, emb_seq_length)
@@ -523,10 +612,14 @@ class TestSortformerEncLabelModelHighResolution:
         )
 
     @pytest.mark.unit
-    def test_constructor_and_exact_output_length(self):
-        model = _create_sortformer_model(high_resolution=True).eval()
-        audio = torch.randn(2, 16000)
-        lengths = torch.tensor([16000, 12000], dtype=torch.long)
+    @pytest.mark.parametrize(
+        "high_resolution, audio_shape, audio_lengths",
+        [(True, (2, 16000), (16000, 12000))],
+    )
+    def test_constructor_and_exact_output_length(self, high_resolution, audio_shape, audio_lengths):
+        model = _create_sortformer_model(high_resolution=high_resolution).eval()
+        audio = torch.randn(audio_shape)
+        lengths = torch.tensor(audio_lengths, dtype=torch.long)
 
         with torch.no_grad():
             _, feature_lengths = model.process_signal(audio, lengths)
@@ -558,14 +651,24 @@ class TestSortformerEncLabelModelHighResolution:
         assert torch.count_nonzero(preds[1, second_length:]) == 0
 
     @pytest.mark.unit
-    def test_low_resolution_overrides_output_subsampling_factor(self):
+    @pytest.mark.parametrize(
+        "high_resolution, requested_output_factor, expected_output_factor, expected_upsample_factor",
+        [(False, 3, 8, 1)],
+    )
+    def test_low_resolution_overrides_output_subsampling_factor(
+        self,
+        high_resolution,
+        requested_output_factor,
+        expected_output_factor,
+        expected_upsample_factor,
+    ):
         model = _create_sortformer_model(
-            high_resolution=False,
-            output_subsampling_factor=3,
+            high_resolution=high_resolution,
+            output_subsampling_factor=requested_output_factor,
         )
 
-        assert model.output_subsampling_factor == model.encoder.subsampling_factor
-        assert model.upsample_factor == 1
+        assert model.output_subsampling_factor == model.encoder.subsampling_factor == expected_output_factor
+        assert model.upsample_factor == expected_upsample_factor
 
     @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [16, 24])
@@ -599,35 +702,63 @@ class TestSortformerEncLabelModelHighResolution:
         assert model._cfg.output_subsampling_factor == expected_factor
 
     @pytest.mark.unit
-    def test_inference_output_subsampling_override_rejects_invalid_factor(self):
-        model = _create_sortformer_model(high_resolution=True)
+    @pytest.mark.parametrize(
+        "high_resolution, invalid_factor, error_match",
+        [(True, 0, "output_subsampling_factor must be a positive integer")],
+    )
+    def test_inference_output_subsampling_override_rejects_invalid_factor(
+        self, high_resolution, invalid_factor, error_match
+    ):
+        model = _create_sortformer_model(high_resolution=high_resolution)
 
-        with pytest.raises(ValueError, match="output_subsampling_factor must be a positive integer"):
-            configure_output_subsampling_factor(model, 0)
+        with pytest.raises(ValueError, match=error_match):
+            configure_output_subsampling_factor(model, invalid_factor)
 
     @pytest.mark.unit
-    def test_explicit_prediction_tensor_path_avoids_automatic_directory(self, tmp_path):
-        explicit_path = tmp_path / "custom" / "predictions.pt"
+    @pytest.mark.parametrize(
+        (
+            "model_filename, manifest_filename, cache_filename, output_subsampling_factor, expected_model_id, "
+            "expected_tensor_filename"
+        ),
+        [("model.nemo", "sample.json", "custom/predictions.pt", 8, "model_sf8", "sample")],
+    )
+    def test_explicit_prediction_tensor_path_avoids_automatic_directory(
+        self,
+        tmp_path,
+        model_filename,
+        manifest_filename,
+        cache_filename,
+        output_subsampling_factor,
+        expected_model_id,
+        expected_tensor_filename,
+    ):
+        explicit_path = tmp_path / cache_filename
         cfg = SimpleNamespace(
-            model_path=str(tmp_path / "model.nemo"),
-            dataset_manifest=str(tmp_path / "sample.json"),
-            output_subsampling_factor=8,
+            model_path=str(tmp_path / model_filename),
+            dataset_manifest=str(tmp_path / manifest_filename),
+            output_subsampling_factor=output_subsampling_factor,
             out_preds_tensors=str(explicit_path),
         )
 
         tensor_path, model_id, tensor_filename = get_tensor_path(cfg)
 
         assert tensor_path == str(explicit_path.absolute())
-        assert model_id == "model_sf8"
-        assert tensor_filename == "sample"
+        assert model_id == expected_model_id
+        assert tensor_filename == expected_tensor_filename
         assert not (tmp_path / "pred_tensors").exists()
 
     @pytest.mark.unit
-    def test_prediction_tensor_cache_is_disabled_without_explicit_path(self, tmp_path):
+    @pytest.mark.parametrize(
+        "model_filename, manifest_filename, output_subsampling_factor",
+        [("model.nemo", "sample.json", 8)],
+    )
+    def test_prediction_tensor_cache_is_disabled_without_explicit_path(
+        self, tmp_path, model_filename, manifest_filename, output_subsampling_factor
+    ):
         cfg = SimpleNamespace(
-            model_path=str(tmp_path / "model.nemo"),
-            dataset_manifest=str(tmp_path / "sample.json"),
-            output_subsampling_factor=8,
+            model_path=str(tmp_path / model_filename),
+            dataset_manifest=str(tmp_path / manifest_filename),
+            output_subsampling_factor=output_subsampling_factor,
             out_preds_tensors=None,
         )
 
@@ -637,11 +768,33 @@ class TestSortformerEncLabelModelHighResolution:
         assert not (tmp_path / "pred_tensors").exists()
 
     @pytest.mark.unit
-    def test_prediction_tensor_cache_round_trip_and_atomic_overwrite(self, tmp_path):
-        tensor_path = tmp_path / "cache" / "predictions.pt"
-        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
-        first_predictions = [torch.ones(1, 4, 2)]
-        second_predictions = [torch.zeros(1, 5, 2)]
+    @pytest.mark.parametrize(
+        (
+            "cache_filename, metadata_version, recording_ids, num_speakers, first_prediction_shape, "
+            "first_fill_value, second_prediction_shape, second_fill_value"
+        ),
+        [("cache/predictions.pt", 1, ("session",), 2, (1, 4, 2), 1.0, (1, 5, 2), 0.0)],
+    )
+    def test_prediction_tensor_cache_round_trip_and_atomic_overwrite(
+        self,
+        tmp_path,
+        cache_filename,
+        metadata_version,
+        recording_ids,
+        num_speakers,
+        first_prediction_shape,
+        first_fill_value,
+        second_prediction_shape,
+        second_fill_value,
+    ):
+        tensor_path = tmp_path / cache_filename
+        metadata = {
+            "version": metadata_version,
+            "recording_ids": list(recording_ids),
+            "num_speakers": num_speakers,
+        }
+        first_predictions = [torch.full(first_prediction_shape, first_fill_value)]
+        second_predictions = [torch.full(second_prediction_shape, second_fill_value)]
 
         save_prediction_tensors(str(tensor_path), first_predictions, metadata)
         assert torch.equal(load_prediction_tensors(str(tensor_path), metadata)[0], first_predictions[0])
@@ -651,20 +804,38 @@ class TestSortformerEncLabelModelHighResolution:
         assert list(tensor_path.parent.glob(f".{tensor_path.name}.*.tmp")) == []
 
     @pytest.mark.unit
-    def test_prediction_tensor_cache_rejects_metadata_mismatch(self, tmp_path):
-        tensor_path = tmp_path / "predictions.pt"
-        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
-        save_prediction_tensors(str(tensor_path), [torch.ones(1, 4, 2)], metadata)
+    @pytest.mark.parametrize(
+        "cache_filename, recording_ids, mismatched_recording_ids, prediction_shape, error_match",
+        [("predictions.pt", ("session",), ("different-session",), (1, 4, 2), "recording_ids")],
+    )
+    def test_prediction_tensor_cache_rejects_metadata_mismatch(
+        self,
+        tmp_path,
+        cache_filename,
+        recording_ids,
+        mismatched_recording_ids,
+        prediction_shape,
+        error_match,
+    ):
+        tensor_path = tmp_path / cache_filename
+        metadata = {"version": 1, "recording_ids": list(recording_ids), "num_speakers": 2}
+        save_prediction_tensors(str(tensor_path), [torch.ones(prediction_shape)], metadata)
 
-        incompatible_metadata = {**metadata, "recording_ids": ["different-session"]}
-        with pytest.raises(ValueError, match="recording_ids"):
+        incompatible_metadata = {**metadata, "recording_ids": list(mismatched_recording_ids)}
+        with pytest.raises(ValueError, match=error_match):
             load_prediction_tensors(str(tensor_path), incompatible_metadata)
 
     @pytest.mark.unit
-    def test_legacy_prediction_tensor_cache_is_supported(self, tmp_path):
-        tensor_path = tmp_path / "legacy.pt"
-        predictions = [torch.ones(1, 4, 2)]
-        metadata = {"version": 1, "recording_ids": ["session"], "num_speakers": 2}
+    @pytest.mark.parametrize(
+        "cache_filename, recording_id, num_speakers, prediction_shape",
+        [("legacy.pt", "session", 2, (1, 4, 2))],
+    )
+    def test_legacy_prediction_tensor_cache_is_supported(
+        self, tmp_path, cache_filename, recording_id, num_speakers, prediction_shape
+    ):
+        tensor_path = tmp_path / cache_filename
+        predictions = [torch.ones(prediction_shape)]
+        metadata = {"version": 1, "recording_ids": [recording_id], "num_speakers": num_speakers}
         torch.save(predictions, tensor_path)
 
         loaded_predictions = load_prediction_tensors(str(tensor_path), metadata)
@@ -681,14 +852,20 @@ class TestSortformerEncLabelModelHighResolution:
             )
 
     @pytest.mark.unit
-    def test_high_resolution_training_loss_is_finite_and_updates_upsampler(self):
+    @pytest.mark.parametrize(
+        "audio_shape, audio_lengths, learning_rate, target_length_trim",
+        [((2, 8000), (8000, 6400), 1e-3, 5)],
+    )
+    def test_high_resolution_training_loss_is_finite_and_updates_upsampler(
+        self, audio_shape, audio_lengths, learning_rate, target_length_trim
+    ):
         model = _create_sortformer_model(high_resolution=True).train()
-        model._optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        audio = torch.randn(2, 8000)
-        audio_lengths = torch.tensor([8000, 6400], dtype=torch.long)
+        model._optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+        audio = torch.randn(audio_shape)
+        audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
         preds = model(audio, audio_lengths)
         targets = (torch.rand_like(preds) > 0.5).to(preds.dtype)
-        target_lens = torch.tensor([preds.shape[1], preds.shape[1] - 5])
+        target_lens = torch.tensor([preds.shape[1], preds.shape[1] - target_length_trim])
 
         metrics = model._get_aux_train_evaluations(preds, targets, target_lens)
         metrics["loss"].backward()
@@ -697,24 +874,40 @@ class TestSortformerEncLabelModelHighResolution:
         assert model.sortformer_modules.subpixel_upsample.weight.grad is not None
 
     @pytest.mark.unit
-    def test_high_resolution_bfloat16_mixed_loss_is_finite(self):
+    @pytest.mark.parametrize(
+        "autocast_dtype, audio_shape, audio_lengths, target_length_trim",
+        [(torch.bfloat16, (2, 4000), (4000, 3200), 3)],
+    )
+    def test_high_resolution_bfloat16_mixed_loss_is_finite(
+        self, autocast_dtype, audio_shape, audio_lengths, target_length_trim
+    ):
         model = _create_sortformer_model(high_resolution=True).eval()
-        audio = torch.randn(2, 4000)
-        audio_lengths = torch.tensor([4000, 3200], dtype=torch.long)
+        audio = torch.randn(audio_shape)
+        audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
 
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cpu", dtype=autocast_dtype):
             preds = model(audio, audio_lengths)
             targets = (torch.rand_like(preds) > 0.5).to(preds.dtype)
-            target_lens = torch.tensor([preds.shape[1], preds.shape[1] - 3])
+            target_lens = torch.tensor([preds.shape[1], preds.shape[1] - target_length_trim])
             metrics = model._get_aux_validation_evaluations(preds, targets, target_lens)
 
         assert torch.isfinite(metrics["val_loss"])
 
     @pytest.mark.unit
-    def test_test_metrics_count_speakers_beyond_model_capacity_as_false_negatives(self):
+    @pytest.mark.parametrize(
+        "reference_speaker_count, prediction_stream_count, expected_precision, expected_recall",
+        [(5, 4, 1.0, 0.8)],
+    )
+    def test_test_metrics_count_speakers_beyond_model_capacity_as_false_negatives(
+        self,
+        reference_speaker_count,
+        prediction_stream_count,
+        expected_precision,
+        expected_recall,
+    ):
         model = _create_sortformer_model().eval()
-        targets = torch.eye(5).unsqueeze(0)
-        preds = targets[:, :, :4]
+        targets = torch.eye(reference_speaker_count).unsqueeze(0)
+        preds = targets[:, :, :prediction_stream_count]
         model.batch_f1_accs_list = []
         model.batch_precision_list = []
         model.batch_recall_list = []
@@ -724,11 +917,11 @@ class TestSortformerEncLabelModelHighResolution:
             batch_idx=0,
             preds=preds,
             targets=targets,
-            target_lens=torch.tensor([5]),
+            target_lens=torch.tensor([reference_speaker_count]),
         )
 
-        assert model.batch_precision_list[0].item() == pytest.approx(1.0)
-        assert model.batch_recall_list[0].item() == pytest.approx(0.8)
+        assert model.batch_precision_list[0].item() == pytest.approx(expected_precision)
+        assert model.batch_recall_list[0].item() == pytest.approx(expected_recall)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [1, 3, 16])
@@ -783,16 +976,35 @@ class TestSortformerEncLabelModelHighResolution:
         assert dataset_constructor.call_args.kwargs["cfg"].subsampling_factor == output_subsampling_factor
 
     @pytest.mark.unit
-    def test_forward_infer_repeats_encoder_mask_at_high_resolution(self):
+    @pytest.mark.parametrize(
+        (
+            "embedding_batch_size, embedding_frame_count, embedding_lengths, expected_output_shape, "
+            "masked_start_frame, expected_masked_nonzero"
+        ),
+        [(2, 3, (3, 2), (2, 24, 4), 16, 0)],
+    )
+    def test_forward_infer_repeats_encoder_mask_at_high_resolution(
+        self,
+        embedding_batch_size,
+        embedding_frame_count,
+        embedding_lengths,
+        expected_output_shape,
+        masked_start_frame,
+        expected_masked_nonzero,
+    ):
         model = _create_sortformer_model(high_resolution=True).eval()
-        emb_seq = torch.randn(2, 3, model._cfg.model_defaults.tf_d_model)
-        emb_seq_length = torch.tensor([3, 2])
+        emb_seq = torch.randn(
+            embedding_batch_size,
+            embedding_frame_count,
+            model._cfg.model_defaults.tf_d_model,
+        )
+        emb_seq_length = torch.tensor(embedding_lengths)
 
         with torch.no_grad():
             preds = model.forward_infer(emb_seq, emb_seq_length)
 
-        assert preds.shape == (2, 24, model._cfg.max_num_of_spks)
-        assert torch.count_nonzero(preds[1, 16:]) == 0
+        assert preds.shape == expected_output_shape
+        assert torch.count_nonzero(preds[1, masked_start_frame:]) == expected_masked_nonzero
 
     @pytest.mark.unit
     @pytest.mark.parametrize("async_streaming", [False, True])
@@ -872,14 +1084,25 @@ class TestSortformerEncLabelModelHighResolution:
         assert total_preds.shape[1] == captured["preds"].shape[1] * expected_ratio
 
     @pytest.mark.unit
-    def test_streaming_export_keeps_coarse_prediction_resolution(self):
+    @pytest.mark.parametrize(
+        "chunk_shape, chunk_lengths, batch_size, initial_spkcache_lengths, initial_fifo_lengths",
+        [((1, 120, 80), (120,), 1, (0,), (0,))],
+    )
+    def test_streaming_export_keeps_coarse_prediction_resolution(
+        self,
+        chunk_shape,
+        chunk_lengths,
+        batch_size,
+        initial_spkcache_lengths,
+        initial_fifo_lengths,
+    ):
         model = _create_sortformer_model(high_resolution=True).eval()
-        chunk = torch.randn(1, 120, 80)
-        chunk_lengths = torch.tensor([120])
-        spkcache = torch.zeros(1, 0, model._cfg.model_defaults.fc_d_model)
-        spkcache_lengths = torch.zeros(1, dtype=torch.long)
-        fifo = torch.zeros(1, 0, model._cfg.model_defaults.fc_d_model)
-        fifo_lengths = torch.zeros(1, dtype=torch.long)
+        chunk = torch.randn(chunk_shape)
+        chunk_lengths = torch.tensor(chunk_lengths)
+        spkcache = torch.zeros(batch_size, 0, model._cfg.model_defaults.fc_d_model)
+        spkcache_lengths = torch.tensor(initial_spkcache_lengths, dtype=torch.long)
+        fifo = torch.zeros(batch_size, 0, model._cfg.model_defaults.fc_d_model)
+        fifo_lengths = torch.tensor(initial_fifo_lengths, dtype=torch.long)
 
         with torch.no_grad():
             preds, _, chunk_pre_encode_lengths = model.forward_for_export(
@@ -894,25 +1117,52 @@ class TestSortformerEncLabelModelHighResolution:
         assert preds.shape[1] == chunk_pre_encode_lengths.max()
 
     @pytest.mark.unit
-    def test_streaming_onnx_export_handles_runtime_state_lengths(self, tmp_path):
+    @pytest.mark.parametrize(
+        (
+            "batch_size, state_capacity, chunk_lengths, export_spkcache_lengths, export_fifo_lengths, "
+            "runtime_state_length_cases"
+        ),
+        [
+            (
+                2,
+                8,
+                (24, 16),
+                (2, 5),
+                (3, 4),
+                (
+                    ((0, 0), (0, 0)),
+                    ((4, 7), (6, 1)),
+                    ((8, 8), (8, 8)),
+                ),
+            )
+        ],
+    )
+    def test_streaming_onnx_export_handles_runtime_state_lengths(
+        self,
+        tmp_path,
+        batch_size,
+        state_capacity,
+        chunk_lengths,
+        export_spkcache_lengths,
+        export_fifo_lengths,
+        runtime_state_length_cases,
+    ):
         model = _create_sortformer_model().eval()
-        batch_size, state_capacity = 2, 8
-        chunk = torch.randn(batch_size, 24, model.encoder._feat_in)
-        chunk_lengths = torch.tensor([24, 16])
+        chunk = torch.randn(batch_size, max(chunk_lengths), model.encoder._feat_in)
+        chunk_lengths = torch.tensor(chunk_lengths)
         spkcache = torch.randn(batch_size, state_capacity, model.sortformer_modules.fc_d_model)
         fifo = torch.randn(batch_size, state_capacity, model.sortformer_modules.fc_d_model)
         export_inputs = (
             chunk,
             chunk_lengths,
             spkcache,
-            torch.tensor([2, 5]),
+            torch.tensor(export_spkcache_lengths),
             fifo,
-            torch.tensor([3, 4]),
+            torch.tensor(export_fifo_lengths),
         )
-        runtime_state_lengths = (
-            (torch.tensor([0, 0]), torch.tensor([0, 0])),
-            (torch.tensor([4, 7]), torch.tensor([6, 1])),
-            (torch.tensor([state_capacity, state_capacity]), torch.tensor([state_capacity, state_capacity])),
+        runtime_state_lengths = tuple(
+            (torch.tensor(spkcache_lengths), torch.tensor(fifo_lengths))
+            for spkcache_lengths, fifo_lengths in runtime_state_length_cases
         )
         with torch.no_grad():
             expected_outputs = [

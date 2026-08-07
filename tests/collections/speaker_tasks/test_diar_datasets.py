@@ -51,40 +51,83 @@ def is_rttm_length_too_long(rttm_file_path, wav_len_in_sec):
 
 class TestAudioToSpeechE2ESpkDiarDataset:
     @pytest.mark.unit
-    def test_empty_subsegments_to_timestamps(self):
-        timestamps = get_subsegments_to_timestamps([])
+    @pytest.mark.parametrize(
+        "subsegments, expected_shape, expected_dtype",
+        [((), (0, 2), torch.long)],
+    )
+    def test_empty_subsegments_to_timestamps(self, subsegments, expected_shape, expected_dtype):
+        timestamps = get_subsegments_to_timestamps(subsegments)
 
-        assert timestamps.shape == (0, 2)
-        assert timestamps.dtype == torch.long
+        assert timestamps.shape == expected_shape
+        assert timestamps.dtype == expected_dtype
 
     @pytest.mark.unit
-    def test_collate_stacks_audio_once(self):
+    @pytest.mark.parametrize(
+        "audio_rows, expected_padded_rows, expected_stack_call_count",
+        [
+            (
+                ((1.0, 2.0), (3.0, 4.0, 5.0), (6.0, 7.0, 8.0, 9.0)),
+                ((1.0, 2.0, 0.0, 0.0), (3.0, 4.0, 5.0, 0.0), (6.0, 7.0, 8.0, 9.0)),
+                4,
+            )
+        ],
+    )
+    def test_collate_stacks_audio_once(self, audio_rows, expected_padded_rows, expected_stack_call_count):
         batch = [
-            (torch.tensor([1.0, 2.0]), torch.tensor(2), torch.ones(2, 2), torch.tensor([2])),
-            (torch.tensor([3.0, 4.0, 5.0]), torch.tensor(3), torch.ones(3, 2), torch.tensor([3])),
-            (torch.tensor([6.0, 7.0, 8.0, 9.0]), torch.tensor(4), torch.ones(4, 2), torch.tensor([4])),
+            (
+                torch.tensor(audio_row),
+                torch.tensor(len(audio_row)),
+                torch.ones(len(audio_row), 2),
+                torch.tensor([len(audio_row)]),
+            )
+            for audio_row in audio_rows
         ]
 
         with patch.object(torch, "stack", wraps=torch.stack) as stack:
             audio_signal, _, _, _ = _eesd_train_collate_fn(None, batch)
 
-        assert stack.call_count == 4
-        assert torch.equal(
-            audio_signal,
-            torch.tensor([[1.0, 2.0, 0.0, 0.0], [3.0, 4.0, 5.0, 0.0], [6.0, 7.0, 8.0, 9.0]]),
-        )
+        assert stack.call_count == expected_stack_call_count
+        assert torch.equal(audio_signal, torch.tensor(expected_padded_rows))
 
     @pytest.mark.unit
-    def test_unlimited_speaker_targets_and_collation(self):
+    @pytest.mark.parametrize(
+        (
+            "rttm_starts, rttm_ends, rttm_speakers, duration, frame_rate, max_spks, "
+            "expected_target_shape, expected_collated_shape"
+        ),
+        [
+            (
+                (0.0, 0.2, 0.4),
+                (0.2, 0.4, 0.6),
+                (0, 1, 2),
+                1.0,
+                10,
+                -1,
+                (10, 3),
+                (2, 3, 3),
+            )
+        ],
+    )
+    def test_unlimited_speaker_targets_and_collation(
+        self,
+        rttm_starts,
+        rttm_ends,
+        rttm_speakers,
+        duration,
+        frame_rate,
+        max_spks,
+        expected_target_shape,
+        expected_collated_shape,
+    ):
         frame_targets = get_frame_targets_from_rttm(
-            rttm_timestamps=([0.0, 0.2, 0.4], [0.2, 0.4, 0.6], [0, 1, 2]),
+            rttm_timestamps=(rttm_starts, rttm_ends, rttm_speakers),
             offset=0.0,
-            duration=1.0,
+            duration=duration,
             round_digits=2,
-            feat_per_sec=10,
-            max_spks=-1,
+            feat_per_sec=frame_rate,
+            max_spks=max_spks,
         )
-        assert frame_targets.shape == (10, 3)
+        assert frame_targets.shape == expected_target_shape
         assert torch.equal(frame_targets.sum(dim=0), torch.tensor([2.0, 2.0, 2.0]))
 
         batch = [
@@ -93,7 +136,7 @@ class TestAudioToSpeechE2ESpkDiarDataset:
         ]
         _, _, targets, _ = _eesd_train_collate_fn(None, batch)
 
-        assert targets.shape == (2, 3, 3)
+        assert targets.shape == expected_collated_shape
         assert torch.count_nonzero(targets[0, :, 2]) == 0
 
     @pytest.mark.unit
