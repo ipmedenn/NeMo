@@ -23,6 +23,15 @@ from nemo.collections.asr.modules.sortformer_modules import SortformerModules
 class TestSortformerModules_CheckStreamingParameters:
     @pytest.mark.unit
     @pytest.mark.parametrize(
+        "num_spks, error_match",
+        [(0, "Parameter 'num_spks' must be at least 1")],
+    )
+    def test_num_speakers_is_validated_during_initialization(self, num_spks, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            SortformerModules(num_spks=num_spks)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
         "n_spk, spkcache_len, fifo_len, chunk_len, lc, rc, spkcache_update_period, spkcache_sil_frames_per_spk",
         [
             (4, 188, 376, 376, 1, 1, 376, 0),  # Example 1: All equal values
@@ -471,6 +480,18 @@ class TestSortformerModules_StreamingUtils:
         assert total_processed >= feat_len - (chunk_len * subsampling_factor)  # Allow for some overlap/remainder
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("param_name", ["chunk_len", "subsampling_factor"])
+    def test_streaming_feat_loader_revalidates_mutated_parameters(self, param_name):
+        sortformer_modules = SortformerModules(chunk_len=10, subsampling_factor=8)
+        setattr(sortformer_modules, param_name, 0)
+        feat_seq = torch.randn(1, 80, 20)
+        feat_seq_length = torch.tensor([20])
+        feat_seq_offset = torch.tensor([0])
+
+        with pytest.raises(ValueError, match=f"Parameter '{param_name}' must be at least 1"):
+            list(sortformer_modules.streaming_feat_loader(feat_seq, feat_seq_length, feat_seq_offset))
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "batch_size, emb_dim, n_frames, num_tensors",
         [
@@ -594,6 +615,7 @@ class TestSortformerModules_StreamingUtils:
         [
             ([(2, 3, 4), (2, 5, 4)], 1, False, None),  # Example 1: Concatenate along dim 1, no lengths
             ([(1, 5), (1, 3)], 1, True, torch.device('cpu')),  # Example 2: With device specification
+            ([(2, 3, 4), (2, 3, 2)], 2, False, None),  # Example 3: Concatenate feature dimensions
         ],
     )
     def test_concat_embs(self, tensor_shapes, dim, return_lengths, device):
@@ -649,6 +671,29 @@ class TestSortformerModules_StreamingUtils:
                 assert lengths.device == device
             else:
                 assert lengths.device == list_of_tensors[0].device
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "tensor_shapes, dim",
+        [
+            ([(2, 3), (4, 3)], 0),
+            ([(2, 3, 4), (2, 3, 2)], 2),
+        ],
+    )
+    def test_concat_embs_rejects_lengths_for_non_temporal_dimensions(self, tensor_shapes, dim):
+        tensors = [torch.randn(*shape) for shape in tensor_shapes]
+
+        with pytest.raises(ValueError, match="temporal dimension"):
+            SortformerModules.concat_embs(tensors, return_lengths=True, dim=dim)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "call_args, error_type",
+        [((), TypeError)],
+    )
+    def test_concat_embs_requires_input_tensors(self, call_args, error_type):
+        with pytest.raises(error_type):
+            SortformerModules.concat_embs(*call_args)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

@@ -89,11 +89,12 @@ class SortformerModules(NeuralModule, Exportable):
     (e.g. Transformer, Fast-Conformer).
     """
 
-    def init_weights(self, m):
-        """Init weights for linear layers."""
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform_(m.weight)
-            m.bias.data.fill_(0.01)
+    @staticmethod
+    def _validate_integer_parameter(name: str, value: int, minimum: int):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"Parameter '{name}' must be an integer, but got {name}: {value}")
+        if value < minimum:
+            raise ValueError(f"Parameter '{name}' must be at least {minimum}, but got {value}.")
 
     def __init__(
         self,
@@ -124,6 +125,7 @@ class SortformerModules(NeuralModule, Exportable):
         async_desync_updates: bool = False,
     ):
         super().__init__()
+        self._validate_integer_parameter('num_spks', num_spks, 1)
         if not isinstance(upsample_factor, int) or isinstance(upsample_factor, bool) or upsample_factor < 1:
             raise ValueError(f"upsample_factor must be a positive integer, got {upsample_factor}")
         # General params
@@ -203,10 +205,7 @@ class SortformerModules(NeuralModule, Exportable):
 
         for param, min_val in param_constraints.items():
             val = getattr(self, param)
-            if not isinstance(val, int):
-                raise TypeError(f"Parameter '{param}' must be an integer, but got {param}: {val}")
-            if val < min_val:
-                raise ValueError(f"Parameter '{param}' must be at least {min_val}, but got {val}.")
+            self._validate_integer_parameter(param, val, min_val)
 
         if self.spkcache_update_period < self.chunk_len:
             logging.warning(
@@ -259,6 +258,8 @@ class SortformerModules(NeuralModule, Exportable):
             feat_lengths (torch.Tensor): Tensor containing lengths of the chunk of feature sequence
                 Shape: (batch_size,)
         """
+        self._validate_integer_parameter('chunk_len', self.chunk_len, 1)
+        self._validate_integer_parameter('subsampling_factor', self.subsampling_factor, 1)
         feat_len = feat_seq.shape[2]
         num_chunks = math.ceil(feat_len / (self.chunk_len * self.subsampling_factor))
         if self.log:
@@ -305,7 +306,7 @@ class SortformerModules(NeuralModule, Exportable):
         hidden_out = self.first_hidden_to_hidden(hidden_out)
         hidden_out = self.dropout(F.relu(hidden_out))
         spk_preds = self.single_hidden_to_spks(hidden_out)
-        preds = F.sigmoid(spk_preds)
+        preds = torch.sigmoid(spk_preds)
         return preds
 
     def upsample_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -366,7 +367,7 @@ class SortformerModules(NeuralModule, Exportable):
 
     @staticmethod
     def concat_embs(
-        list_of_tensors=List[torch.Tensor],
+        list_of_tensors: List[torch.Tensor],
         return_lengths: bool = False,
         dim: int = 1,
         device: torch.device = None,
@@ -376,16 +377,20 @@ class SortformerModules(NeuralModule, Exportable):
 
         Args:
             list_of_tensors (List[torch.Tensor]): List of tensors to concatenate
-            return_lengths (bool): Whether to return lengths of the concatenated tensors
+            return_lengths (bool): Whether to return temporal lengths. Only supported when ``dim=1``.
             dim (int): Concatenation axis
             device (torch.device): device to use for tensor operations
 
         Returns:
             embs (torch.Tensor): concatenated tensor
         """
-        embs = torch.cat(list_of_tensors, dim=dim).to(device)
-        lengths = torch.tensor(embs.shape[1]).repeat(embs.shape[0]).to(device)
+        embs = torch.cat(list_of_tensors, dim=dim)
+        if return_lengths and dim != 1:
+            raise ValueError("return_lengths=True is only supported for the temporal dimension, dim=1.")
+        if device is not None:
+            embs = embs.to(device)
         if return_lengths:
+            lengths = torch.full((embs.shape[0],), embs.shape[1], dtype=torch.long, device=embs.device)
             return embs, lengths
         else:
             return embs
