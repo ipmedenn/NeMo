@@ -505,46 +505,45 @@ class SortformerModules(NeuralModule, Exportable):
         spkcache_fifo_chunk_preds = torch.where(preds_mask, spkcache_fifo_chunk_preds, torch.tensor(0.0))
         return spkcache_fifo_chunk_preds
 
-    def streaming_update_async(self, streaming_state, chunk, chunk_lengths, preds, lc: int = 0, rc: int = 0):
+    def _gather_async_predictions(
+        self,
+        streaming_state,
+        preds,
+        spkcache_lengths,
+        fifo_lengths,
+        chunk_lengths,
+        max_spkcache_len,
+        max_fifo_len,
+        max_chunk_len,
+        lc,
+    ):
         """
-        Update the speaker cache and FIFO queue with the chunk of embeddings and speaker predictions.
-        Asynchronous version, which means speaker cache, FIFO and chunk may have different lengths within a batch.
-        Should be used for real streaming applications.
+        Map packed predictions to rectangular speaker-cache, FIFO, and chunk regions.
 
         Args:
-            streaming_state (SortformerStreamingState): Previous streaming state including speaker cache and FIFO
-            chunk (torch.Tensor): chunk of embeddings to be predicted
-                Shape: (batch_size, lc+chunk_len+rc, emb_dim)
-            chunk_lengths (torch.Tensor): Lengths of current chunk
+            streaming_state (StreamingSortformerState): Streaming state containing prediction dtype information.
+            preds (torch.Tensor): Packed speaker predictions.
+                Shape: (batch_size, packed_length, n_spk)
+            spkcache_lengths (torch.Tensor): Valid speaker-cache lengths.
                 Shape: (batch_size,)
-            preds (torch.Tensor): Speaker predictions of the [spkcache + fifo + chunk] embeddings
-                Shape: (batch_size, spkcache_len + fifo_len + lc+chunk_len+rc, num_spks)
-            lc and rc (int): The left & right offset of the chunk,
-                only the chunk[:, lc:chunk_len+lc] is used for update of speaker cache and FIFO queue
+            fifo_lengths (torch.Tensor): Valid FIFO lengths.
+                Shape: (batch_size,)
+            chunk_lengths (torch.Tensor): Valid normalized chunk lengths.
+                Shape: (batch_size,)
+            max_spkcache_len (int): Physical speaker-cache capacity.
+            max_fifo_len (int): Physical FIFO capacity.
+            max_chunk_len (int): Physical chunk capacity excluding context.
+            lc (int): Left chunk context excluded from the returned chunk predictions.
 
         Returns:
-            streaming_state (SortformerStreamingState): Current streaming state including speaker cache and FIFO
-            chunk_preds (torch.Tensor): Speaker predictions of the chunk embeddings
-                Shape: (batch_size, chunk_len, num_spks)
+            current_spkcache_preds (torch.Tensor): Left-aligned speaker-cache predictions.
+                Shape: (batch_size, max_spkcache_len, n_spk)
+            current_fifo_preds (torch.Tensor): Left-aligned FIFO predictions.
+                Shape: (batch_size, max_fifo_len, n_spk)
+            chunk_preds (torch.Tensor): Left-aligned chunk predictions.
+                Shape: (batch_size, max_chunk_len, n_spk)
         """
-        batch_size, _, emb_dim = chunk.shape
-        n_spk = preds.shape[2]
-
-        max_spkcache_len, max_fifo_len, max_chunk_len = (
-            streaming_state.spkcache.shape[1],
-            streaming_state.fifo.shape[1],
-            chunk.shape[1] - lc - rc,
-        )
-
-        # A finalized row may flush its entire FIFO, so the temporary pop buffer must fit max_fifo_len.
-        max_pop_out_len = max(self.spkcache_update_period, max_fifo_len, max_chunk_len)
-        max_pop_out_len = min(max_pop_out_len, max_chunk_len + max_fifo_len)
-
-        spkcache_lengths = streaming_state.spkcache_lengths
-        fifo_lengths = streaming_state.fifo_lengths
-        chunk_lengths = (chunk_lengths - lc).clamp(min=0, max=max_chunk_len)
-
-        # Extract current predictions for all state regions with one rectangular gather.
+        batch_size, _, n_spk = preds.shape
         spkcache_positions = torch.arange(max_spkcache_len, device=preds.device).unsqueeze(0)
         fifo_positions = torch.arange(max_fifo_len, device=preds.device).unsqueeze(0)
         chunk_positions = torch.arange(max_chunk_len, device=preds.device).unsqueeze(0)
@@ -561,11 +560,29 @@ class SortformerModules(NeuralModule, Exportable):
         padded_preds = torch.cat([preds, preds.new_zeros((batch_size, 1, n_spk))], dim=1)
         gathered_preds = torch.gather(padded_preds, 1, pred_indices.unsqueeze(-1).expand(-1, -1, n_spk))
         gathered_preds = gathered_preds.type_as(streaming_state.spkcache_preds)
-        current_spkcache_preds, current_fifo_preds, chunk_preds = torch.split(
-            gathered_preds, [max_spkcache_len, max_fifo_len, max_chunk_len], dim=1
-        )
+        return torch.split(gathered_preds, [max_spkcache_len, max_fifo_len, max_chunk_len], dim=1)
 
-        # Compute each row's FIFO pop and retained lengths without synchronizing values to Python.
+    def _compute_async_fifo_pop_lengths(
+        self, spkcache_lengths, fifo_lengths, chunk_lengths, max_fifo_len
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate per-row FIFO eviction and retained lengths without host synchronization.
+
+        Args:
+            spkcache_lengths (torch.Tensor): Valid speaker-cache lengths.
+                Shape: (batch_size,)
+            fifo_lengths (torch.Tensor): Valid FIFO lengths.
+                Shape: (batch_size,)
+            chunk_lengths (torch.Tensor): Valid normalized chunk lengths.
+                Shape: (batch_size,)
+            max_fifo_len (int): Physical FIFO capacity.
+
+        Returns:
+            pop_out_lengths (torch.Tensor): Number of FIFO frames popped per row.
+                Shape: (batch_size,)
+            new_fifo_lengths (torch.Tensor): Number of FIFO frames retained per row.
+                Shape: (batch_size,)
+        """
         combined_fifo_lengths = fifo_lengths + chunk_lengths
         overflow_lengths = combined_fifo_lengths - max_fifo_len
         update_period = torch.full_like(combined_fifo_lengths, self.spkcache_update_period)
@@ -587,9 +604,55 @@ class SortformerModules(NeuralModule, Exportable):
         # A zero-length chunk marks a finalized row; flush its remaining FIFO into the speaker cache.
         pop_out_lengths = torch.where(chunk_lengths == 0, fifo_lengths, pop_out_lengths)
         new_fifo_lengths = combined_fifo_lengths - pop_out_lengths
+        return pop_out_lengths, new_fifo_lengths
 
-        # Treat the old FIFO and current chunk as a per-row logical concatenation. Gather both
-        # the popped prefix and retained suffix in one operation while keeping the state left-aligned.
+    def _update_async_fifo(
+        self,
+        streaming_state,
+        chunk,
+        current_fifo_preds,
+        chunk_preds,
+        fifo_lengths,
+        pop_out_lengths,
+        new_fifo_lengths,
+        max_chunk_len,
+        max_pop_out_len,
+        lc,
+    ):
+        """
+        Pop and retain logical ``[FIFO | chunk]`` frames and mutate the FIFO streaming state.
+
+        Args:
+            streaming_state (StreamingSortformerState): Streaming state whose FIFO tensors are updated.
+            chunk (torch.Tensor): Current chunk embeddings including left and right context.
+                Shape: (batch_size, lc + max_chunk_len + rc, emb_dim)
+            current_fifo_preds (torch.Tensor): Predictions for the valid current FIFO region.
+                Shape: (batch_size, max_fifo_len, n_spk)
+            chunk_preds (torch.Tensor): Predictions for the current chunk region.
+                Shape: (batch_size, max_chunk_len, n_spk)
+            fifo_lengths (torch.Tensor): Valid FIFO lengths before this update.
+                Shape: (batch_size,)
+            pop_out_lengths (torch.Tensor): Number of logical FIFO/chunk frames popped per row.
+                Shape: (batch_size,)
+            new_fifo_lengths (torch.Tensor): Number of logical FIFO/chunk frames retained per row.
+                Shape: (batch_size,)
+            max_chunk_len (int): Physical chunk capacity excluding context.
+            max_pop_out_len (int): Physical capacity of the rectangular popped-frame buffer.
+            lc (int): Left context offset of the current chunk.
+
+        Returns:
+            pop_out_embs (torch.Tensor): Left-aligned popped embeddings.
+                Shape: (batch_size, max_pop_out_len, emb_dim)
+            pop_out_preds (torch.Tensor): Left-aligned predictions for popped embeddings.
+                Shape: (batch_size, max_pop_out_len, n_spk)
+            valid_pop_mask (torch.Tensor): Mask identifying valid popped frames.
+                Shape: (batch_size, max_pop_out_len)
+        """
+        batch_size, _, emb_dim = chunk.shape
+        n_spk = chunk_preds.shape[2]
+        max_fifo_len = streaming_state.fifo.shape[1]
+
+        # Treat the old FIFO and current chunk as a per-row logical concatenation.
         update_chunk = chunk[:, lc : lc + max_chunk_len].type_as(streaming_state.fifo)
         fifo_chunk_embs = torch.cat(
             [
@@ -607,8 +670,8 @@ class SortformerModules(NeuralModule, Exportable):
             ],
             dim=1,
         )
-        pop_positions = torch.arange(max_pop_out_len, device=preds.device).unsqueeze(0)
-        retained_positions = torch.arange(max_fifo_len, device=preds.device).unsqueeze(0)
+        pop_positions = torch.arange(max_pop_out_len, device=chunk_preds.device).unsqueeze(0)
+        retained_positions = torch.arange(max_fifo_len, device=chunk_preds.device).unsqueeze(0)
         pop_logical_indices = pop_positions.expand(batch_size, -1)
         retained_logical_indices = pop_out_lengths.unsqueeze(1) + retained_positions
         fifo_logical_indices = torch.cat([pop_logical_indices, retained_logical_indices], dim=1)
@@ -636,6 +699,27 @@ class SortformerModules(NeuralModule, Exportable):
         pop_out_preds, updated_fifo_preds = torch.split(gathered_fifo_preds, [max_pop_out_len, max_fifo_len], dim=1)
         valid_pop_mask = pop_positions < pop_out_lengths.unsqueeze(1)
 
+        streaming_state.fifo = updated_fifo
+        streaming_state.fifo_preds = updated_fifo_preds
+        streaming_state.fifo_lengths.copy_(new_fifo_lengths)
+        return pop_out_embs, pop_out_preds, valid_pop_mask
+
+    def _update_async_silence_profile(self, streaming_state, pop_out_embs, pop_out_preds, valid_pop_mask):
+        """
+        Update the per-row running silence profile while ignoring padded popped frames.
+
+        Args:
+            streaming_state (StreamingSortformerState): Streaming state whose silence profile is updated.
+            pop_out_embs (torch.Tensor): Left-aligned popped embeddings.
+                Shape: (batch_size, max_pop_out_len, emb_dim)
+            pop_out_preds (torch.Tensor): Left-aligned predictions for popped embeddings.
+                Shape: (batch_size, max_pop_out_len, n_spk)
+            valid_pop_mask (torch.Tensor): Mask identifying valid popped frames.
+                Shape: (batch_size, max_pop_out_len)
+
+        Returns:
+            None: This method mutates the silence-profile portion of ``streaming_state``.
+        """
         if not self.use_learnable_sil_emb:
             is_sil = (pop_out_preds.sum(dim=2) < self.sil_threshold) & valid_pop_mask
             sil_count = is_sil.sum(dim=1)
@@ -650,6 +734,36 @@ class SortformerModules(NeuralModule, Exportable):
             )
             streaming_state.mean_sil_emb.copy_(updated_mean_sil_emb)
             streaming_state.n_sil_frames.copy_(updated_n_sil_frames)
+
+    def _update_async_spkcache(
+        self,
+        streaming_state,
+        current_spkcache_preds,
+        pop_out_embs,
+        pop_out_preds,
+        pop_out_lengths,
+    ):
+        """
+        Append popped FIFO frames and compress overflowing rows, mutating the speaker cache state.
+
+        Args:
+            streaming_state (StreamingSortformerState): Streaming state whose speaker-cache tensors are updated.
+            current_spkcache_preds (torch.Tensor): Fresh predictions for the current speaker cache.
+                Shape: (batch_size, max_spkcache_len, n_spk)
+            pop_out_embs (torch.Tensor): Left-aligned popped FIFO embeddings.
+                Shape: (batch_size, max_pop_out_len, emb_dim)
+            pop_out_preds (torch.Tensor): Left-aligned predictions for popped FIFO embeddings.
+                Shape: (batch_size, max_pop_out_len, n_spk)
+            pop_out_lengths (torch.Tensor): Number of valid popped frames per row.
+                Shape: (batch_size,)
+
+        Returns:
+            None: This method mutates the speaker-cache portion of ``streaming_state``.
+        """
+        batch_size, max_pop_out_len, emb_dim = pop_out_embs.shape
+        n_spk = pop_out_preds.shape[2]
+        max_spkcache_len = streaming_state.spkcache.shape[1]
+        spkcache_lengths = streaming_state.spkcache_lengths
 
         # Build the compression candidates as [valid cache | popped FIFO] for every row.
         updated_spkcache_lengths = spkcache_lengths + pop_out_lengths
@@ -674,7 +788,9 @@ class SortformerModules(NeuralModule, Exportable):
             ],
             dim=1,
         )
-        candidate_positions = torch.arange(max_spkcache_len + max_pop_out_len, device=preds.device).unsqueeze(0)
+        candidate_positions = torch.arange(max_spkcache_len + max_pop_out_len, device=pop_out_preds.device).unsqueeze(
+            0
+        )
         candidate_logical_indices = candidate_positions.expand(batch_size, -1)
         valid_candidate_indices = candidate_positions < updated_spkcache_lengths.unsqueeze(1)
         candidate_physical_indices = torch.where(
@@ -693,9 +809,6 @@ class SortformerModules(NeuralModule, Exportable):
             candidate_spkcache_preds, 1, candidate_physical_indices.unsqueeze(-1).expand(-1, -1, n_spk)
         )
 
-        streaming_state.fifo = updated_fifo
-        streaming_state.fifo_preds = updated_fifo_preds
-        streaming_state.fifo_lengths.copy_(new_fifo_lengths)
         streaming_state.spkcache = updated_spkcache[:, : self.spkcache_len, :]
         streaming_state.spkcache_preds = updated_spkcache_preds[:, : self.spkcache_len, :]
 
@@ -709,6 +822,78 @@ class SortformerModules(NeuralModule, Exportable):
             )
             streaming_state.spkcache_compressed[idx] = True
         streaming_state.spkcache_lengths.copy_(updated_spkcache_lengths.clamp(max=self.spkcache_len))
+
+    def streaming_update_async(self, streaming_state, chunk, chunk_lengths, preds, lc: int = 0, rc: int = 0):
+        """
+        Update the speaker cache and FIFO queue with the chunk of embeddings and speaker predictions.
+        Asynchronous version, which means speaker cache, FIFO and chunk may have different lengths within a batch.
+        Should be used for real streaming applications.
+
+        Args:
+            streaming_state (SortformerStreamingState): Previous streaming state including speaker cache and FIFO
+            chunk (torch.Tensor): chunk of embeddings to be predicted
+                Shape: (batch_size, lc+chunk_len+rc, emb_dim)
+            chunk_lengths (torch.Tensor): Lengths of current chunk
+                Shape: (batch_size,)
+            preds (torch.Tensor): Speaker predictions of the [spkcache + fifo + chunk] embeddings
+                Shape: (batch_size, spkcache_len + fifo_len + lc+chunk_len+rc, num_spks)
+            lc and rc (int): The left & right offset of the chunk,
+                only the chunk[:, lc:chunk_len+lc] is used for update of speaker cache and FIFO queue
+
+        Returns:
+            streaming_state (SortformerStreamingState): Current streaming state including speaker cache and FIFO
+            chunk_preds (torch.Tensor): Speaker predictions of the chunk embeddings
+                Shape: (batch_size, chunk_len, num_spks)
+        """
+        max_spkcache_len, max_fifo_len, max_chunk_len = (
+            streaming_state.spkcache.shape[1],
+            streaming_state.fifo.shape[1],
+            chunk.shape[1] - lc - rc,
+        )
+
+        # A finalized row may flush its entire FIFO, so the temporary pop buffer must fit max_fifo_len.
+        max_pop_out_len = max(self.spkcache_update_period, max_fifo_len, max_chunk_len)
+        max_pop_out_len = min(max_pop_out_len, max_chunk_len + max_fifo_len)
+
+        spkcache_lengths = streaming_state.spkcache_lengths
+        fifo_lengths = streaming_state.fifo_lengths
+        chunk_lengths = (chunk_lengths - lc).clamp(min=0, max=max_chunk_len)
+
+        current_spkcache_preds, current_fifo_preds, chunk_preds = self._gather_async_predictions(
+            streaming_state,
+            preds,
+            spkcache_lengths,
+            fifo_lengths,
+            chunk_lengths,
+            max_spkcache_len,
+            max_fifo_len,
+            max_chunk_len,
+            lc,
+        )
+
+        pop_out_lengths, new_fifo_lengths = self._compute_async_fifo_pop_lengths(
+            spkcache_lengths, fifo_lengths, chunk_lengths, max_fifo_len
+        )
+        pop_out_embs, pop_out_preds, valid_pop_mask = self._update_async_fifo(
+            streaming_state,
+            chunk,
+            current_fifo_preds,
+            chunk_preds,
+            fifo_lengths,
+            pop_out_lengths,
+            new_fifo_lengths,
+            max_chunk_len,
+            max_pop_out_len,
+            lc,
+        )
+        self._update_async_silence_profile(streaming_state, pop_out_embs, pop_out_preds, valid_pop_mask)
+        self._update_async_spkcache(
+            streaming_state,
+            current_spkcache_preds,
+            pop_out_embs,
+            pop_out_preds,
+            pop_out_lengths,
+        )
 
         if self.log:
             logging.info(
