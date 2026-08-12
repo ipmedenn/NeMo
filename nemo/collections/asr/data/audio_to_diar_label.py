@@ -56,6 +56,7 @@ def get_subsegments_to_timestamps(
             A tensor containing the scaled and rounded timestamps for each subsegment.
     """
     if len(subsegments) == 0:
+        # Each row stores the start and end frame indices.
         return torch.zeros((0, 2), dtype=torch.long)
     seg_ts = (torch.tensor(subsegments) * feat_per_sec).float()
     ts_round = torch.round(seg_ts, decimals=decimals)
@@ -127,18 +128,15 @@ def get_frame_targets_from_rttm(
     `feat_level_target` will later be converted to base-segment level diarization label.
 
     Args:
-        rttm_timestamps (list):
-            List containing start and end time for each speaker segment label.
-            stt_list, end_list and speaker_list are contained.
-        feat_per_sec (int):
-            Number of feature frames per second.
-            This quantity is determined by window_stride variable in preprocessing module.
-        max_spks (int):
-            Maximum number of target speakers. Use -1 to preserve all speakers.
+        rttm_timestamps (list): Lists of start times, end times, and speaker indices for the RTTM segments.
+        offset (float): Start time of the selected audio region in seconds.
+        duration (float): Duration of the selected audio region in seconds.
+        round_digits (int): Decimal precision associated with the prepared RTTM timestamps.
+        feat_per_sec (int): Number of feature frames per second, as determined by the preprocessing window stride.
+        max_spks (int): Maximum number of target speakers. Use ``-1`` to preserve all speakers.
 
     Returns:
-        feat_level_target (torch.tensor):
-            Tensor containing label for each feature level frame.
+        feat_level_target (torch.Tensor): Speaker labels for each feature-level frame.
     """
     stt_list, end_list, speaker_list = rttm_timestamps
     sorted_speakers = sorted(list(set(speaker_list)))
@@ -522,25 +520,17 @@ class AudioToSpeechE2ESpkDiarDataset(_AudioToSpeechE2ESpkDiarDataset):
     }
 
     Args:
-        manifest_filepath (str):
-            Path to the input manifest JSON file containing paths to audio and RTTM files.
-        soft_label_thres (float):
-            Threshold for assigning soft labels to segments based on RTTM file information.
-        session_len_sec (float):
-            Duration of each session (in seconds) for training or fine-tuning.
-        num_spks (int):
-            Number of speakers in the audio files.
-        featurizer:
-            Instance of a featurizer for generating features from the raw waveform.
-        window_stride (float):
-            Window stride (in seconds) for extracting acoustic features, used to calculate
-            the number of feature frames.
-        global_rank (int):
-            Global rank of the current process (used for distributed training).
-        soft_targets (bool):
-            Whether or not to use soft targets during training.
-        subsampling_factor (int):
-            Number of feature frames represented by each diarization target frame.
+        manifest_filepath (str): Path to the input manifest JSON file containing paths to audio and RTTM files.
+        soft_label_thres (float): Threshold for assigning soft labels from RTTM information.
+        session_len_sec (float): Duration of each session in seconds for training or fine-tuning.
+        num_spks (int): Number of speakers in the audio files.
+        featurizer (WaveformFeaturizer): Featurizer that loads raw waveforms.
+        fb_featurizer (FilterbankFeatures): Filterbank featurizer that defines the feature frame geometry.
+        window_stride (float): Window stride in seconds used to calculate the number of feature frames.
+        global_rank (int): Global rank of the current process for distributed training.
+        soft_targets (bool): Whether to retain soft speaker-activity targets.
+        device (str or torch.device): Device on which collated audio and targets are placed.
+        subsampling_factor (int): Number of feature frames represented by each diarization target frame. Defaults to 8.
 
     Methods:
         eesd_train_collate_fn(batch):

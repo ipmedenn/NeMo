@@ -97,7 +97,13 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return result
 
     def _resolve_output_resolution(self):
-        """Resolve and validate the high-resolution and returned-output configuration."""
+        """
+        Resolve and validate the high-resolution and returned-output configuration.
+
+        Returns:
+            high_resolution (bool): Whether the model emits predictions at the pre-subsampling frame rate.
+            output_subsampling_factor (int): Validated number of 10 ms feature frames per returned prediction.
+        """
         high_resolution = self._cfg.get("high_resolution", False)
         if not isinstance(high_resolution, bool):
             raise TypeError(f"high_resolution must be a boolean, got {type(high_resolution).__name__}")
@@ -348,7 +354,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         )
 
     def _call_pre_encode(self, features, lengths):
-        """Call the encoder preprocessor with time-major features."""
+        """
+        Invoke heterogeneous encoder pre-encode modules through one streaming interface.
+
+        Streaming and export callers provide time-major features and require a ``(features, lengths)`` result,
+        while supported pre-encode modules expose different interfaces. ``torch.nn.Linear`` returns only projected
+        features, ``FeatureStacking`` expects channel-first input, and other subsamplers accept time-major input with
+        keyword arguments. This helper adapts those cases without changing the caller-facing layout.
+
+        Args:
+            features (torch.Tensor): Input features with shape ``(B, T, D)``.
+            lengths (torch.Tensor): Valid feature lengths with shape ``(B,)``.
+
+        Returns:
+            pre_encoded_features (torch.Tensor): Pre-encoded features with shape ``(B, T', D')``.
+            pre_encoded_lengths (torch.Tensor): Valid pre-encoded lengths with shape ``(B,)``.
+        """
         from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 
         if isinstance(self.encoder.pre_encode, torch.nn.Linear):
@@ -655,7 +676,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return ["spkcache_fifo_chunk_preds", "chunk_pre_encode_embs", "chunk_pre_encode_lengths"]
 
     def streaming_input_examples(self, batch_size: int = 1):
-        """Create model-sized input examples for exporting the streaming graph."""
+        """
+        Create model-sized input examples for exporting the streaming graph.
+
+        Args:
+            batch_size (int): Number of examples in each generated tensor. Defaults to 1.
+
+        Returns:
+            chunk (torch.Tensor): Input feature chunk with shape ``(B, T_chunk, D_feature)``.
+            chunk_lengths (torch.Tensor): Valid chunk lengths with shape ``(B,)``.
+            spkcache (torch.Tensor): Speaker-cache embeddings with shape ``(B, T_cache, D_embedding)``.
+            spkcache_lengths (torch.Tensor): Valid speaker-cache lengths with shape ``(B,)``.
+            fifo (torch.Tensor): FIFO embeddings with shape ``(B, T_fifo, D_embedding)``.
+            fifo_lengths (torch.Tensor): Valid FIFO lengths with shape ``(B,)``.
+        """
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
 
@@ -677,7 +711,19 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         return chunk, chunk_lengths, spkcache, spkcache_lengths, fifo, fifo_lengths
 
     def streaming_export(self, output: str, input_example=None, batch_size: int = 1):
-        """Export the streaming graph with explicit inputs or model-sized defaults."""
+        """
+        Export the streaming graph with explicit inputs or model-sized defaults.
+
+        Args:
+            output (str): Output filename whose extension selects the export format.
+            input_example (Optional[Tuple[torch.Tensor, ...]]): Six streaming input tensors used to trace the model.
+                If ``None``, model-sized examples are generated.
+            batch_size (int): Batch size for generated input examples. Ignored when ``input_example`` is provided.
+
+        Returns:
+            exported_outputs (List[str]): Output paths returned by ``Exportable.export`` for the exported subnets.
+            export_descriptions (List[str]): Descriptions returned by ``Exportable.export`` for the exported subnets.
+        """
         if input_example is None:
             input_example = self.streaming_input_examples(batch_size=batch_size)
         return self.export(output, input_example=input_example)
@@ -843,7 +889,23 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         max_chunk_len,
         lc_enc,
     ):
-        """Gather ragged high-resolution chunk predictions without synchronizing lengths to Python."""
+        """
+        Gather ragged high-resolution chunk predictions without synchronizing lengths to Python.
+
+        Args:
+            high_resolution_preds (torch.Tensor): Predictions over packed speaker-cache, FIFO, and chunk frames with
+                shape ``(B, T_packed * upsample_factor, S)``.
+            spkcache_lengths (torch.Tensor): Per-row valid speaker-cache lengths in encoder frames, with shape
+                ``(B,)``.
+            fifo_lengths (torch.Tensor): Per-row valid FIFO lengths in encoder frames, with shape ``(B,)``.
+            chunk_lengths (torch.Tensor): Per-row valid central-chunk lengths in encoder frames, with shape ``(B,)``.
+            max_chunk_len (int): Physical central-chunk capacity in encoder frames after excluding both contexts.
+            lc_enc (int): Number of encoded left-context frames preceding the central chunk in packed time.
+
+        Returns:
+            chunk_preds (torch.Tensor): Gathered predictions with shape
+                ``(B, max_chunk_len * upsample_factor, S)`` and zero padding after each valid row.
+        """
         batch_size, _, num_speakers = high_resolution_preds.shape
         output_length = max_chunk_len * self.upsample_factor
         output_positions = torch.arange(output_length, device=high_resolution_preds.device).unsqueeze(0)
@@ -900,6 +962,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
             total_preds (torch.Tensor): Tensor containing total predicted speaker activity probabilities
                 Shape: (batch_size, cumulative pred length, num_speakers)
+            drop_extra_pre_encoded (int): Number of leading pre-encoded frames to discard before streaming updates.
             left_offset (int): left offset for the current chunk
             right_offset (int): right offset for the current chunk
 
@@ -1023,7 +1086,20 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     @staticmethod
     def _align_predictions_and_targets(preds, targets, target_lens):
-        """Align prediction and target time dimensions and preserve their shared dtype."""
+        """
+        Align prediction and target time dimensions and preserve their shared dtype.
+
+        Args:
+            preds (torch.Tensor): Speaker predictions with shape ``(B, T_pred, S)``.
+            targets (torch.Tensor): Speaker targets with shape ``(B, T_target, S)``.
+            target_lens (torch.Tensor): Valid target lengths with shape ``(B,)``.
+
+        Returns:
+            aligned_preds (torch.Tensor): Predictions truncated to the shared time dimension.
+            aligned_targets (torch.Tensor): Targets cast to the prediction dtype and truncated to the shared time
+                dimension.
+            clamped_target_lens (torch.Tensor): Target lengths clamped to the shared time dimension.
+        """
         targets = targets.to(preds.dtype)
         common_num_frames = min(preds.shape[1], targets.shape[1])
         if preds.shape[1] != targets.shape[1]:

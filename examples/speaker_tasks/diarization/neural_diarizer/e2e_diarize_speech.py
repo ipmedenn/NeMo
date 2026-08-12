@@ -140,7 +140,17 @@ class DiarizationConfig:
 def configure_output_subsampling_factor(
     diar_model: SortformerEncLabelModel, output_subsampling_factor: Optional[int]
 ) -> int:
-    """Apply an inference-time output resolution override and return the effective factor."""
+    """
+    Apply an inference-time output resolution override and return the effective factor.
+
+    Args:
+        diar_model (SortformerEncLabelModel): Model whose output resolution is configured.
+        output_subsampling_factor (Optional[int]): Requested output factor in 10 ms feature frames. If ``None``,
+            the model's current factor is retained.
+
+    Returns:
+        effective_output_subsampling_factor (int): Applied output subsampling factor.
+    """
     if output_subsampling_factor is None:
         return diar_model.output_subsampling_factor
     if type(output_subsampling_factor) is not int or output_subsampling_factor < 1:
@@ -189,7 +199,9 @@ def get_tensor_path(cfg: DiarizationConfig) -> tuple[Optional[str], str, str]:
         cfg (DiarizationConfig): The configuration object containing model and dataset details.
 
     Returns:
-        Tuple containing the optional cache path, model identifier, and manifest identifier.
+        tensor_path (Optional[str]): Absolute prediction-cache path, or ``None`` when caching is disabled.
+        model_id (str): Model identifier including the configured output subsampling factor.
+        tensor_filename (str): Manifest-derived identifier used in the prediction tensor filename.
     """
     tensor_filename = os.path.basename(cfg.dataset_manifest).replace("manifest.", "").replace(".json", "")
     model_path = Path(cfg.model_path).expanduser().absolute()
@@ -234,7 +246,7 @@ def diarization_objective(
             Defaults to False.
 
     Returns:
-        float: The Diarization Error Rate (DER) for the given set of postprocessing parameters.
+        der (float): Diarization Error Rate for the given set of postprocessing parameters.
     """
     with tempfile.TemporaryDirectory(dir=temp_out_dir, prefix="Diar_PostProcessing_") as _:
         if trial is not None:
@@ -314,15 +326,18 @@ def convert_pred_mat_to_segments(
 
     Args:
         audio_rttm_map_dict (dict): dictionary of audio file path, offset, duration and RTTM filepath.
+        postprocessing_cfg (Optional[PostProcessingParams]): Postprocessing parameters, or ``None`` when
+            ``bypass_postprocessing`` is enabled.
         batch_preds_list (List[torch.Tensor]): list of prediction matrices containing sigmoid values for each speaker.
             Dimension: [(1, num_frames, num_speakers), ..., (1, num_frames, num_speakers)]
         unit_10ms_frame_count (int, optional): number of 10ms segments in a frame. Defaults to 8.
         bypass_postprocessing (bool, optional): if True, postprocessing will be bypassed. Defaults to False.
+        out_rttm_dir (Optional[str]): Directory in which to write RTTM files, or ``None`` to skip writing them.
 
     Returns:
-       all_hypothesis (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
-       all_reference (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
-       all_uems (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
+        all_hypothesis (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
+        all_reference (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
+        all_uems (list): list of (uniq_id, list[SupervisionSegment]) per audio file.
     """
     all_hypothesis, all_reference, all_uems = [], [], []
     if postprocessing_cfg is None and not bypass_postprocessing:

@@ -59,6 +59,12 @@ class StreamingSortformerState:
     n_sil_frames = None
 
     def to(self, device):
+        """
+        Move state tensors to a target device while preserving their dtypes.
+
+        Args:
+            device (str or torch.device): Target device for every tensor in the streaming state.
+        """
         if self.spkcache is not None:
             self.spkcache = self.spkcache.to(device)
         if self.spkcache_lengths is not None:
@@ -91,6 +97,18 @@ class SortformerModules(NeuralModule, Exportable):
 
     @staticmethod
     def _validate_integer_parameter(name: str, value: int, minimum: int):
+        """
+        Validate an integer parameter against an inclusive minimum.
+
+        Args:
+            name (str): Parameter name used in validation error messages.
+            value (int): Parameter value to validate.
+            minimum (int): Smallest permitted value.
+
+        Raises:
+            TypeError: If ``value`` is not an integer or is a boolean.
+            ValueError: If ``value`` is less than ``minimum``.
+        """
         if not isinstance(value, int) or isinstance(value, bool):
             raise TypeError(f"Parameter '{name}' must be an integer, but got {name}: {value}")
         if value < minimum:
@@ -310,7 +328,16 @@ class SortformerModules(NeuralModule, Exportable):
         return preds
 
     def upsample_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Upsample transformer hidden states when high-resolution output is enabled."""
+        """
+        Upsample transformer hidden states when high-resolution output is enabled.
+
+        Args:
+            hidden_states (torch.Tensor): Transformer states with shape ``(B, T, H)``.
+
+        Returns:
+            upsampled_hidden_states (torch.Tensor): States with shape ``(B, T * upsample_factor, H)``, or the
+                unchanged input when upsampling is disabled.
+        """
         if self.subpixel_upsample is None:
             return hidden_states
         batch_size, num_frames, hidden_size = hidden_states.shape
@@ -325,13 +352,14 @@ class SortformerModules(NeuralModule, Exportable):
         Average non-overlapping prediction windows while retaining a partial final window.
 
         Args:
-            preds: Speaker probabilities with shape ``(B, T, S)``.
-            downsample_factor: Number of consecutive input frames per output frame.
-            lengths: Optional valid input lengths with shape ``(B,)``. When provided,
+            preds (torch.Tensor): Speaker probabilities with shape ``(B, T, S)``.
+            downsample_factor (int): Number of consecutive input frames per output frame.
+            lengths (Optional[torch.Tensor]): Valid input lengths with shape ``(B,)``. When provided,
                 padded frames are excluded from each sample's final partial-window average.
 
         Returns:
-            Downsampled probabilities with time length ``ceil(T / downsample_factor)``.
+            downsampled_preds (torch.Tensor): Probabilities with shape
+                ``(B, ceil(T / downsample_factor), S)``.
         """
         if not isinstance(downsample_factor, int) or isinstance(downsample_factor, bool) or downsample_factor < 1:
             raise ValueError(f"downsample_factor must be a positive integer, got {downsample_factor}")
@@ -401,13 +429,13 @@ class SortformerModules(NeuralModule, Exportable):
         Concatenates lengths[i] first embeddings of embs[i], and pads the rest elements with zeros.
 
         Args:
-            embs: List of embeddings Tensors of (batch_size, n_frames, emb_dim) shape
-            lengths: List of lengths Tensors of (batch_size,) shape
-            output_length: Optional fixed output width. It must fit the full physical capacity of all input tensors.
+            embs (List[torch.Tensor]): Embedding tensors with shape ``(B, T_i, D)``.
+            lengths (List[torch.Tensor]): Valid lengths for each embedding tensor, each with shape ``(B,)``.
+            output_length (Optional[int]): Fixed output width. It must fit the full physical capacity of all inputs.
 
         Returns:
-            output: concatenated embeddings Tensor of (batch_size, n_frames, emb_dim) shape
-            total_lengths: output lengths Tensor of (batch_size,) shape
+            output (torch.Tensor): Concatenated and padded embeddings with shape ``(B, T_output, D)``.
+            total_lengths (torch.Tensor): Summed valid output lengths with shape ``(B,)``.
         """
         # Error handling for mismatched list lengths
         if len(embs) != len(lengths):
@@ -716,9 +744,6 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, max_pop_out_len, n_spk)
             valid_pop_mask (torch.Tensor): Mask identifying valid popped frames.
                 Shape: (batch_size, max_pop_out_len)
-
-        Returns:
-            None: This method mutates the silence-profile portion of ``streaming_state``.
         """
         if not self.use_learnable_sil_emb:
             is_sil = (pop_out_preds.sum(dim=2) < self.sil_threshold) & valid_pop_mask
@@ -756,9 +781,6 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, max_pop_out_len, n_spk)
             pop_out_lengths (torch.Tensor): Number of valid popped frames per row.
                 Shape: (batch_size,)
-
-        Returns:
-            None: This method mutates the speaker-cache portion of ``streaming_state``.
         """
         batch_size, max_pop_out_len, emb_dim = pop_out_embs.shape
         n_spk = pop_out_preds.shape[2]
@@ -837,8 +859,8 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size,)
             preds (torch.Tensor): Speaker predictions of the [spkcache + fifo + chunk] embeddings
                 Shape: (batch_size, spkcache_len + fifo_len + lc+chunk_len+rc, num_spks)
-            lc and rc (int): The left & right offset of the chunk,
-                only the chunk[:, lc:chunk_len+lc] is used for update of speaker cache and FIFO queue
+            lc (int): Left-context offset. Only ``chunk[:, lc:chunk_len+lc]`` is used to update the state.
+            rc (int): Right-context offset excluded from the speaker-cache and FIFO update.
 
         Returns:
             streaming_state (SortformerStreamingState): Current streaming state including speaker cache and FIFO
@@ -917,8 +939,8 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, lc+chunk_len+rc, emb_dim)
             preds (torch.Tensor): speaker predictions of the [spkcache + fifo + chunk] embeddings
                 Shape: (batch_size, spkcache_len + fifo_len + lc+chunk_len+rc, num_spks)
-            lc and rc (int): left & right offset of the chunk,
-                only the chunk[:, lc:chunk_len+lc] is used for update of speaker cache and FIFO queue
+            lc (int): Left-context offset. Only ``chunk[:, lc:chunk_len+lc]`` is used to update the state.
+            rc (int): Right-context offset excluded from the speaker-cache and FIFO update.
 
         Returns:
             streaming_state (SortformerStreamingState): current streaming state including speaker cache and FIFO

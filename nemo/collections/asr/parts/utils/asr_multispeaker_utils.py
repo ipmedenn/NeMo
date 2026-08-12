@@ -188,7 +188,15 @@ def get_pil_targets(labels: torch.Tensor, preds: torch.Tensor, speaker_permutati
 def _validate_hungarian_target_inputs(
     labels: torch.Tensor, preds: torch.Tensor, assignment_mask: Optional[torch.Tensor] = None
 ) -> None:
-    """Validate tensor shapes used by the Hungarian target generators."""
+    """
+    Validate tensor shapes used by the Hungarian target generators.
+
+    Args:
+        labels (torch.Tensor): Ground-truth labels with shape ``(B, T, S)``.
+        preds (torch.Tensor): Predicted speaker probabilities with shape ``(B, T, N)``.
+        assignment_mask (Optional[torch.Tensor]): Feasible assignments with shape ``(B, S, N)``, or ``None`` to
+            permit every label-to-stream pairing.
+    """
     if labels.ndim != 3 or preds.ndim != 3:
         raise ValueError(
             f"labels and preds must be 3-D tensors with shapes (B, T, S) and (B, T, N), "
@@ -226,16 +234,15 @@ def get_pil_targets_hungarian(
     a different number of label speakers and prediction streams.
 
     Args:
-        labels: Ground-truth labels with shape (B, T, S).
-        preds: Predicted speaker probabilities with shape (B, T, N).
-        assignment_mask: Optional feasibility mask with shape (B, S, N). ``False`` entries
+        labels (torch.Tensor): Ground-truth labels with shape ``(B, T, S)``.
+        preds (torch.Tensor): Predicted speaker probabilities with shape ``(B, T, N)``.
+        assignment_mask (Optional[torch.Tensor]): Optional feasibility mask with shape ``(B, S, N)``. ``False`` entries
             are excluded from the assignment.
 
     Returns:
-        A tuple containing:
-            - Aligned labels with shape (B, T, N).
-            - Speaker indices with shape (B, N), where each value identifies the source label
-              speaker or is -1 for an unmatched stream or an inactive speaker.
+        aligned_labels (torch.Tensor): Labels aligned to prediction streams with shape ``(B, T, N)``.
+        speaker_indices (torch.Tensor): Source label indices with shape ``(B, N)``. Unmatched streams and streams
+            assigned to inactive speakers contain ``-1``.
     """
     _validate_hungarian_target_inputs(labels, preds, assignment_mask)
     batch_size, num_frames, num_label_speakers = labels.shape
@@ -316,13 +323,14 @@ def get_ats_targets_hungarian(
     when there are fewer prediction streams and leave extra prediction streams unmatched.
 
     Args:
-        labels: Ground-truth labels with shape (B, T, S).
-        preds: Predicted speaker probabilities with shape (B, T, N).
-        thres: Activity threshold used to determine each speaker's first active frame.
-        tolerance: Maximum arrival-time difference, in frames, allowed for an assignment.
+        labels (torch.Tensor): Ground-truth labels with shape ``(B, T, S)``.
+        preds (torch.Tensor): Predicted speaker probabilities with shape ``(B, T, N)``.
+        thres (float): Activity threshold used to determine each speaker's first active frame.
+        tolerance (float): Maximum arrival-time difference, in frames, allowed for an assignment.
 
     Returns:
-        Aligned labels and source speaker indices, with shapes (B, T, N) and (B, N).
+        aligned_labels (torch.Tensor): Labels aligned to arrival-time-compatible streams with shape ``(B, T, N)``.
+        speaker_indices (torch.Tensor): Source label indices with shape ``(B, N)``; unmatched streams contain ``-1``.
     """
     _validate_hungarian_target_inputs(labels, preds)
     if tolerance < 0:

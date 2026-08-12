@@ -58,16 +58,29 @@ class InferenceProfiler:
         self._installed = False
 
     def _synchronize(self):
+        """Synchronize pending CUDA work before recording wall-clock time."""
         if self.model.device.type == 'cuda':
             torch.cuda.synchronize(self.model.device)
 
     def _flush_cuda_events(self):
+        """Accumulate completed CUDA event timings and clear the pending events."""
         for section, events in self._cuda_events.items():
             elapsed = sum(start.elapsed_time(end) for start, end in events) / 1000
             self.section_times[section] = self.section_times.get(section, 0.0) + elapsed
         self._cuda_events.clear()
 
     def _section_wrapper(self, section, function):
+        """
+        Wrap a callable to record its invocation count and elapsed time.
+
+        Args:
+            section (str): Profiling section under which measurements are accumulated.
+            function (Callable): Callable to profile.
+
+        Returns:
+            timed_function (Callable): Wrapped callable that records profiling measurements.
+        """
+
         @wraps(function)
         def timed_function(*args, **kwargs):
             self.section_calls[section] = self.section_calls.get(section, 0) + 1
@@ -91,10 +104,19 @@ class InferenceProfiler:
         return timed_function
 
     def _install_section(self, instance, method_name, section):
+        """
+        Replace an instance method with a profiled wrapper.
+
+        Args:
+            instance (object): Object whose bound method is replaced.
+            method_name (str): Name of the method to wrap.
+            section (str): Profiling section under which measurements are accumulated.
+        """
         original_method = getattr(instance, method_name)
         setattr(instance, method_name, self._section_wrapper(section, original_method))
 
     def install(self):
+        """Install profiling wrappers by monkey-patching model methods; repeated calls are no-ops."""
         if self._installed:
             return
         self._installed = True
@@ -148,6 +170,12 @@ class InferenceProfiler:
         self.model.forward = timed_forward
 
     def log_summary(self, audio_duration: float):
+        """
+        Log accumulated inference timing measurements.
+
+        Args:
+            audio_duration (float): Duration of processed audio in seconds.
+        """
         self._synchronize()
         self._flush_cuda_events()
         if audio_duration <= 0 or self.forward_time <= 0:
