@@ -1123,8 +1123,8 @@ class TestSortformerEncLabelModelHighResolution:
 
         with (
             patch(
-                "nemo.collections.asr.models.sortformer_diar_models.ts_vad_post_processing",
-                return_value=torch.empty(0, 2),
+                "nemo.collections.asr.models.sortformer_diar_models.predlist_to_timestamps",
+                return_value=[[[] for _ in range(model._cfg.max_num_of_spks)]],
             ) as postprocess,
             patch(
                 "nemo.collections.asr.models.sortformer_diar_models.generate_diarization_output_lines",
@@ -1133,5 +1133,11 @@ class TestSortformerEncLabelModelHighResolution:
         ):
             model._diarize_output_processing(outputs, ["sample"], diarize_config)
 
-        assert postprocess.call_count == model._cfg.max_num_of_spks
-        assert all(call.kwargs["unit_10ms_frame_count"] == expected_frame_count for call in postprocess.call_args_list)
+        postprocess.assert_called_once()
+        call_kwargs = postprocess.call_args.kwargs
+        assert len(call_kwargs["batch_preds_list"]) == 1
+        assert torch.equal(call_kwargs["batch_preds_list"][0], outputs)
+        assert call_kwargs["audio_rttm_map_dict"] == model._diarize_audio_rttm_map
+        assert call_kwargs["cfg_vad_params"] is diarize_config.postprocessing_params
+        assert call_kwargs["unit_10ms_frame_count"] == expected_frame_count
+        assert call_kwargs["bypass_postprocessing"] is False

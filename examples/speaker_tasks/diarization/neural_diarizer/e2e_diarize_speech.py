@@ -113,7 +113,7 @@ class DiarizationConfig:
     async_streaming: bool = False
     # Use fixed-size encoder inputs, trading extra padded computation for stable shapes.
     async_pad_to_max: bool = False
-    # Compile the latency-dominant encoder; dynamic shapes support variable input lengths.
+    # Compile the frontend encoder and optional transformer encoder; dynamic shapes support variable input lengths.
     compile_encoder: bool = False
     # Emulate production streams arriving independently; offline batches otherwise update in lockstep.
     async_desync_updates: bool = False
@@ -451,6 +451,9 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
     if cfg.compile_encoder:
         logging.info("Compiling the frontend encoder")
         diar_model.encoder = torch.compile(diar_model.encoder, dynamic=True)
+        if diar_model.transformer_encoder is not None and len(diar_model.transformer_encoder.layers) > 0:
+            logging.info("Compiling the optional transformer encoder")
+            diar_model.transformer_encoder = torch.compile(diar_model.transformer_encoder, dynamic=True)
 
     postprocessing_cfg = load_postprocessing_from_yaml(cfg.postprocessing_yaml)
     tensor_path, model_id, tensor_filename = get_tensor_path(cfg)

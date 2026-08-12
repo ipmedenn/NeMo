@@ -39,7 +39,7 @@ from nemo.collections.asr.parts.utils.asr_multispeaker_utils import (
     get_pil_targets_hungarian,
 )
 from nemo.collections.asr.parts.utils.speaker_utils import generate_diarization_output_lines
-from nemo.collections.asr.parts.utils.vad_utils import ts_vad_post_processing
+from nemo.collections.asr.parts.utils.vad_utils import predlist_to_timestamps
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes import ModelPT
 from nemo.core.classes.common import PretrainedModelInfo, safe_instantiate
@@ -434,11 +434,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     ) -> Union[List[List[str]], Tuple[List[List[str]], List[torch.Tensor]]]:
         """
         Processes the diarization outputs and generates RTTM (Real-time Text Markup) files.
-        TODO: Currently, this function is not included in mixin test because of
-              `ts_vad_post_processing` function.
-              (1) Implement a test-compatible function
-              (2) `vad_utils.py` has `predlist_to_timestamps` function that is close to this function.
-                  Needs to consolute differences and implement the test-compatible function.
 
         Args:
             outputs (torch.Tensor): Sorted tensor containing Sigmoid values for predicted speaker labels.
@@ -458,22 +453,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         else:
             preds_list.extend(torch.split(outputs, [1] * outputs.shape[0]))
 
-        for sample_idx, uniq_id in enumerate(uniq_ids):
-            offset = self._diarize_audio_rttm_map[uniq_id]['offset']
-            speaker_assign_mat = preds_list[sample_idx].squeeze(dim=0)
-            speaker_timestamps = [[] for _ in range(speaker_assign_mat.shape[-1])]
-            for spk_id in range(speaker_assign_mat.shape[-1]):
-                ts_mat = ts_vad_post_processing(
-                    speaker_assign_mat[:, spk_id],
-                    cfg_vad_params=diarcfg.postprocessing_params,
-                    unit_10ms_frame_count=self.output_subsampling_factor,
-                    bypass_postprocessing=False,
-                )
-                ts_mat = ts_mat + offset
-                ts_seg_raw_list = ts_mat.tolist()
-                ts_seg_list = [[round(stt, 2), round(end, 2)] for (stt, end) in ts_seg_raw_list]
-                speaker_timestamps[spk_id].extend(ts_seg_list)
-
+        batch_audio_rttm_map = {uniq_id: self._diarize_audio_rttm_map[uniq_id] for uniq_id in uniq_ids}
+        total_speaker_timestamps = predlist_to_timestamps(
+            batch_preds_list=preds_list,
+            audio_rttm_map_dict=batch_audio_rttm_map,
+            cfg_vad_params=diarcfg.postprocessing_params,
+            unit_10ms_frame_count=self.output_subsampling_factor,
+            bypass_postprocessing=False,
+        )
+        for speaker_timestamps in total_speaker_timestamps:
             diar_output_lines = generate_diarization_output_lines(
                 speaker_timestamps=speaker_timestamps, model_spk_num=len(speaker_timestamps)
             )
