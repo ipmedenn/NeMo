@@ -2002,18 +2002,20 @@ def ts_vad_post_processing(
 
 def binarization_vectorized(sequence: torch.Tensor, per_args: Dict[str, float]) -> torch.Tensor:
     """
-    Fully vectorized binarization with hysteresis support (onset != offset).
+    Fully vectorized binarization with hysteresis support.
 
-    Equivalent to binarization() but without any Python-level frame loops.
-    Uses a cummax forward-fill trick to resolve ambiguous frames in the
-    hysteresis dead-zone between offset and onset thresholds.
+    When onset is greater than or equal to offset, values between the thresholds
+    retain the previous state. When onset is less than offset, values strictly
+    between the thresholds toggle the previous state.
 
     Args:
         sequence (torch.Tensor): Frame-level predictions (num_frames,).
-        per_args: Dict with keys onset, offset, pad_onset, pad_offset, frame_length_in_sec.
+        per_args (Dict[str, float]): Parameters with keys onset, offset, pad_onset,
+            pad_offset, and frame_length_in_sec.
 
     Returns:
-        speech_segments (torch.Tensor): (num_segments, 2) with [start, end] in seconds.
+        speech_segments (torch.Tensor): Tensor with shape (num_segments, 2)
+            containing [start, end] in seconds. Empty output has shape (0, 2).
     """
     frame_length_in_sec = per_args.get('frame_length_in_sec', 0.01)
     onset = per_args.get('onset', 0.5)
@@ -2022,34 +2024,43 @@ def binarization_vectorized(sequence: torch.Tensor, per_args: Dict[str, float]) 
     pad_offset = per_args.get('pad_offset', 0.0)
 
     device = sequence.device
+    empty_segments = torch.empty((0, 2), dtype=torch.float32, device=device)
 
     if len(sequence) == 0:
-        return torch.empty(0, device=device)
+        return empty_segments
 
-    if onset == offset:
-        above = sequence > onset
+    num_frames = sequence.shape[0]
+    positions = torch.arange(1, num_frames + 1, device=device)
+
+    if onset >= offset:
+        force_on = sequence > onset
+        force_off = sequence < offset
+        has_event = force_on | force_off
+        event_positions = torch.where(has_event, positions, torch.zeros_like(positions))
+        last_event_positions = torch.cummax(event_positions, dim=0).values
+
+        event_states = torch.cat([torch.zeros(1, dtype=torch.bool, device=device), force_on])
+        above = event_states[last_event_positions]
     else:
-        above_onset = sequence > onset
-        below_offset = sequence < offset
-        state = torch.where(
-            above_onset,
-            torch.ones(1, dtype=torch.long, device=device),
-            torch.where(
-                below_offset,
+        force_on = sequence >= offset
+        force_off = sequence <= onset
+        toggle = (sequence > onset) & (sequence < offset)
+
+        has_reset = force_on | force_off
+        reset_positions = torch.where(has_reset, positions, torch.zeros_like(positions))
+        last_reset_positions = torch.cummax(reset_positions, dim=0).values
+
+        reset_states = torch.cat([torch.zeros(1, dtype=torch.long, device=device), force_on.to(torch.long)])
+        base_state = reset_states[last_reset_positions]
+
+        toggle_prefix = torch.cat(
+            [
                 torch.zeros(1, dtype=torch.long, device=device),
-                torch.full((1,), -1, dtype=torch.long, device=device),
-            ),
+                torch.cumsum(toggle.to(torch.long), dim=0),
+            ]
         )
-        non_ambig_mask = state != -1
-        indices = torch.arange(len(state), device=device)
-        last_non_ambig_idx = torch.where(non_ambig_mask, indices, torch.zeros_like(indices))
-        last_non_ambig_idx = torch.cummax(last_non_ambig_idx, dim=0)[0]
-        resolved = state[last_non_ambig_idx]
-        above = torch.where(
-            resolved == -1,
-            torch.zeros(1, dtype=torch.long, device=device),
-            resolved,
-        ).bool()
+        toggles_since_reset = toggle_prefix[positions] - toggle_prefix[last_reset_positions]
+        above = torch.logical_xor(base_state.bool(), toggles_since_reset.remainder(2).bool())
 
     padded = torch.nn.functional.pad(above.float(), (1, 1), value=0.0)
     diff = padded[1:] - padded[:-1]
@@ -2057,13 +2068,7 @@ def binarization_vectorized(sequence: torch.Tensor, per_args: Dict[str, float]) 
     ends = torch.where(diff < -0.5)[0]
 
     if len(starts) == 0:
-        return torch.empty(0, device=device)
-
-    if len(starts) > len(ends):
-        ends = torch.cat([ends, torch.tensor([len(sequence)], device=device, dtype=ends.dtype)])
-    min_len = min(len(starts), len(ends))
-    starts = starts[:min_len]
-    ends = ends[:min_len]
+        return empty_segments
 
     start_times = starts.float() * frame_length_in_sec - pad_onset
     start_times = torch.clamp(start_times, min=0.0)
@@ -2071,7 +2076,7 @@ def binarization_vectorized(sequence: torch.Tensor, per_args: Dict[str, float]) 
 
     valid = end_times > start_times
     if not valid.any():
-        return torch.empty(0, device=device)
+        return empty_segments
     speech_segments = torch.stack([start_times[valid], end_times[valid]], dim=1)
 
     if pad_onset > 0 or pad_offset > 0:
