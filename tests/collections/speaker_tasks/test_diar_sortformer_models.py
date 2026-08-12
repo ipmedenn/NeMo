@@ -21,17 +21,15 @@ import onnx
 import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
-    InferenceProfiler,
     configure_output_subsampling_factor,
     get_tensor_path,
-    load_prediction_tensors,
-    save_prediction_tensors,
 )
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
+from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler
 
 
 class RecordingSpecAugment(torch.nn.Module):
@@ -766,81 +764,6 @@ class TestSortformerEncLabelModelHighResolution:
 
         assert tensor_path is None
         assert not (tmp_path / "pred_tensors").exists()
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        (
-            "cache_filename, metadata_version, recording_ids, num_speakers, first_prediction_shape, "
-            "first_fill_value, second_prediction_shape, second_fill_value"
-        ),
-        [("cache/predictions.pt", 1, ("session",), 2, (1, 4, 2), 1.0, (1, 5, 2), 0.0)],
-    )
-    def test_prediction_tensor_cache_round_trip_and_atomic_overwrite(
-        self,
-        tmp_path,
-        cache_filename,
-        metadata_version,
-        recording_ids,
-        num_speakers,
-        first_prediction_shape,
-        first_fill_value,
-        second_prediction_shape,
-        second_fill_value,
-    ):
-        tensor_path = tmp_path / cache_filename
-        metadata = {
-            "version": metadata_version,
-            "recording_ids": list(recording_ids),
-            "num_speakers": num_speakers,
-        }
-        first_predictions = [torch.full(first_prediction_shape, first_fill_value)]
-        second_predictions = [torch.full(second_prediction_shape, second_fill_value)]
-
-        save_prediction_tensors(str(tensor_path), first_predictions, metadata)
-        assert torch.equal(load_prediction_tensors(str(tensor_path), metadata)[0], first_predictions[0])
-
-        save_prediction_tensors(str(tensor_path), second_predictions, metadata)
-        assert torch.equal(load_prediction_tensors(str(tensor_path), metadata)[0], second_predictions[0])
-        assert list(tensor_path.parent.glob(f".{tensor_path.name}.*.tmp")) == []
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "cache_filename, recording_ids, mismatched_recording_ids, prediction_shape, error_match",
-        [("predictions.pt", ("session",), ("different-session",), (1, 4, 2), "recording_ids")],
-    )
-    def test_prediction_tensor_cache_rejects_metadata_mismatch(
-        self,
-        tmp_path,
-        cache_filename,
-        recording_ids,
-        mismatched_recording_ids,
-        prediction_shape,
-        error_match,
-    ):
-        tensor_path = tmp_path / cache_filename
-        metadata = {"version": 1, "recording_ids": list(recording_ids), "num_speakers": 2}
-        save_prediction_tensors(str(tensor_path), [torch.ones(prediction_shape)], metadata)
-
-        incompatible_metadata = {**metadata, "recording_ids": list(mismatched_recording_ids)}
-        with pytest.raises(ValueError, match=error_match):
-            load_prediction_tensors(str(tensor_path), incompatible_metadata)
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "cache_filename, recording_id, num_speakers, prediction_shape",
-        [("legacy.pt", "session", 2, (1, 4, 2))],
-    )
-    def test_legacy_prediction_tensor_cache_is_supported(
-        self, tmp_path, cache_filename, recording_id, num_speakers, prediction_shape
-    ):
-        tensor_path = tmp_path / cache_filename
-        predictions = [torch.ones(prediction_shape)]
-        metadata = {"version": 1, "recording_ids": [recording_id], "num_speakers": num_speakers}
-        torch.save(predictions, tensor_path)
-
-        loaded_predictions = load_prediction_tensors(str(tensor_path), metadata)
-
-        assert torch.equal(loaded_predictions[0], predictions[0])
 
     @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [0, -1, 1.5, True])
