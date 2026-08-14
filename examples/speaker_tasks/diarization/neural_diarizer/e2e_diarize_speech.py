@@ -104,6 +104,10 @@ class DiarizationConfig:
 
     use_lhotse: bool = True
     batch_duration: int = 100000
+    # Total padded-audio duration threshold, in seconds, for feature extraction.
+    # Above it, batches are split along the batch dimension; <= 0 disables splitting.
+    # Lower this value for feature-extraction OOMs.
+    max_batch_dur: float = 100000
 
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25  # Collar in seconds for DER calculation
@@ -408,6 +412,8 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.model_path, map_location=map_location)
     else:
         raise ValueError("cfg.model_path must end with.ckpt or.nemo!")
+
+    diar_model.max_batch_dur = cfg.max_batch_dur
 
     cfg.output_subsampling_factor = configure_output_subsampling_factor(diar_model, cfg.output_subsampling_factor)
     diar_model._cfg.test_ds.session_len_sec = cfg.session_len_sec
