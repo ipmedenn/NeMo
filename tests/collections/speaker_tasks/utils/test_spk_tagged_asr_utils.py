@@ -13,11 +13,20 @@
 # limitations under the License.
 
 import json
+import math
+from contextlib import nullcontext
+from types import SimpleNamespace
 
+import examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer as streaming_infer
 import pytest
 import torch
 from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import (
     MultitalkerTranscriptionConfig,
+    collect_diar_predictions,
+    configure_diar_streaming,
+    set_batch_rttm_masks,
+    validate_feature_frame_strides,
+    write_and_score_diar_predictions,
 )
 from omegaconf import OmegaConf
 
@@ -35,7 +44,9 @@ from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     get_word_dict_content_online,
     write_seglst,
 )
+from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from tests.collections.asr.test_asr_rnnt_encoder_model_bpe import asr_model as offline_asr_model
+from tests.collections.speaker_tasks.test_diar_sortformer_models import _create_sortformer_model
 from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
 
@@ -259,24 +270,437 @@ class TestAppendWordAndTsSeq:
 
 class TestGetDiarPredOutStream:
     class Dummy:
-        def __init__(self, diar_model, nframes):
+        def __init__(self, diar_model, block_frame_length, frame_hop_length):
             self.diar_model = diar_model
-            self._nframes_per_chunk = nframes
+            self._nframes_per_chunk = block_frame_length
+            self._frame_hop_length = frame_hop_length
 
     @pytest.mark.unit
-    @pytest.mark.parametrize("step_num,nframes", [(0, 3), (1, 3)])
-    def test_get_diar_pred_out_stream(self, diar_model, step_num, nframes):
+    @pytest.mark.parametrize(
+        (
+            "step_num,block_frame_length,frame_hop_length,is_buffer_empty,"
+            "expected_stream_end,expected_block_start,expected_block_end"
+        ),
+        [
+            (0, 3, 3, False, 3, 0, 3),
+            (1, 3, 3, False, 6, 3, 6),
+            (1, 4, 3, False, 6, 3, 7),
+            (2, 4, 3, True, 10, 6, 10),
+        ],
+    )
+    def test_get_diar_pred_out_stream(
+        self,
+        diar_model,
+        step_num,
+        block_frame_length,
+        frame_hop_length,
+        is_buffer_empty,
+        expected_stream_end,
+        expected_block_start,
+        expected_block_end,
+    ):
         B, T, N = 2, 10, 4
         mats = torch.arange(B * T * N, dtype=torch.float32).reshape(B, T, N)
-        # Set rttms_mask_mats on the diar_model
         diar_model.rttms_mask_mats = mats
-        dummy = self.Dummy(diar_model, nframes)
-        new_stream, new_chunk = SpeakerTaggedASR.get_diar_pred_out_stream(dummy, step_num)
+        dummy = self.Dummy(diar_model, block_frame_length, frame_hop_length)
 
-        start = step_num * nframes
-        end = start + nframes
-        assert new_stream.shape[1] == min(end, T)
-        assert torch.equal(new_chunk, new_stream[:, start:end])
+        new_stream, new_chunk = SpeakerTaggedASR.get_diar_pred_out_stream(
+            dummy, step_num=step_num, is_buffer_empty=is_buffer_empty
+        )
+
+        assert torch.equal(new_stream, mats[:, :expected_stream_end])
+        assert torch.equal(new_chunk, mats[:, expected_block_start:expected_block_end])
+
+
+class TestConfigureDiarStreaming:
+    @pytest.mark.unit
+    @pytest.mark.parametrize("diar_right_context", [0, 1, 2, 3, 5, 8, 13])
+    def test_accepts_nonnegative_diar_right_context(self, diar_model, diar_right_context):
+        cfg = MultitalkerTranscriptionConfig(diar_right_context=diar_right_context)
+
+        configure_diar_streaming(diar_model, cfg, output_subsampling_factor=8)
+
+        assert diar_model.sortformer_modules.chunk_right_context == diar_right_context
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "diar_right_context,error_type",
+        [
+            (-1, ValueError),
+            (1.5, TypeError),
+            ("3", TypeError),
+            (None, TypeError),
+            (True, TypeError),
+        ],
+    )
+    def test_rejects_invalid_diar_right_context(self, diar_model, diar_right_context, error_type):
+        cfg = MultitalkerTranscriptionConfig(diar_right_context=diar_right_context)
+
+        with pytest.raises(error_type, match="diar_right_context"):
+            configure_diar_streaming(diar_model, cfg, output_subsampling_factor=8)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "diar_chunk_len,diar_right_context",
+        [(14, 0), (14, 5), (10, 13)],
+    )
+    def test_applies_asr_aligned_diarization_geometry(self, diar_model, diar_chunk_len, diar_right_context):
+        cfg = MultitalkerTranscriptionConfig(diar_right_context=diar_right_context)
+
+        configure_diar_streaming(
+            diar_model,
+            cfg,
+            output_subsampling_factor=8,
+            diar_chunk_len=diar_chunk_len,
+        )
+
+        assert diar_model.sortformer_modules.chunk_len == diar_chunk_len
+        assert diar_model.sortformer_modules.chunk_right_context == diar_right_context
+
+    @pytest.mark.unit
+    def test_preserves_model_streaming_geometry(self, diar_model):
+        expected_geometry = (
+            diar_model.sortformer_modules.chunk_len,
+            diar_model.sortformer_modules.chunk_left_context,
+        )
+        cfg = MultitalkerTranscriptionConfig()
+
+        configure_diar_streaming(diar_model, cfg, output_subsampling_factor=8)
+
+        assert (
+            diar_model.sortformer_modules.chunk_len,
+            diar_model.sortformer_modules.chunk_left_context,
+        ) == expected_geometry
+        assert diar_model.sortformer_modules.chunk_right_context == 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("asr_output_subsampling_factor,diar_chunk_len", [(8, 14)])
+    def test_aligns_high_resolution_diarizer_to_asr_factor(self, asr_output_subsampling_factor, diar_chunk_len):
+        diar_model = _create_sortformer_model(
+            high_resolution=True,
+            output_subsampling_factor=1,
+        )
+        cfg = MultitalkerTranscriptionConfig()
+
+        effective_factor = configure_diar_streaming(
+            diar_model,
+            cfg,
+            output_subsampling_factor=asr_output_subsampling_factor,
+            diar_chunk_len=diar_chunk_len,
+        )
+
+        assert effective_factor == asr_output_subsampling_factor
+        assert diar_model.output_subsampling_factor == asr_output_subsampling_factor
+        assert diar_model._cfg.output_subsampling_factor == asr_output_subsampling_factor
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("asr_output_subsampling_factor", [3])
+    def test_rejects_diarizer_that_cannot_match_asr_factor(self, diar_model, asr_output_subsampling_factor):
+        cfg = MultitalkerTranscriptionConfig(streaming_mode=False)
+
+        with pytest.raises(ValueError, match="requires the diarization output subsampling factor"):
+            configure_diar_streaming(
+                diar_model,
+                cfg,
+                output_subsampling_factor=asr_output_subsampling_factor,
+            )
+
+
+class TestFeatureFrameStrides:
+    @pytest.mark.unit
+    @pytest.mark.parametrize("asr_stride,diar_stride", [(0.01, 0.01), (0.02, 0.02)])
+    def test_accepts_equal_feature_frame_strides(self, asr_stride, diar_stride):
+        asr_model = SimpleNamespace(cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=asr_stride)))
+        diar_model = SimpleNamespace(_cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=diar_stride)))
+
+        validate_feature_frame_strides(asr_model, diar_model)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("asr_stride,diar_stride", [(0.01, 0.02)])
+    def test_rejects_mismatched_feature_frame_strides(self, asr_stride, diar_stride):
+        asr_model = SimpleNamespace(cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=asr_stride)))
+        diar_model = SimpleNamespace(_cfg=SimpleNamespace(preprocessor=SimpleNamespace(window_stride=diar_stride)))
+
+        with pytest.raises(ValueError, match="equal ASR and diarization feature-frame strides"):
+            validate_feature_frame_strides(asr_model, diar_model)
+
+
+class TestStreamingViewRouting:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "strategy,spk_supervision,masked_asr,diar_right_context",
+        [
+            ("serial", "diar", True, 3),
+            ("parallel", "diar", False, 5),
+            ("serial", "rttm", False, 13),
+            ("parallel", "rttm", True, 13),
+        ],
+    )
+    def test_launch_routes_separate_views_without_changing_asr(
+        self, monkeypatch, strategy, spk_supervision, masked_asr, diar_right_context
+    ):
+        captured = {}
+        asr_audio = torch.randn(1, 80, 112)
+        asr_lengths = torch.tensor([112])
+
+        class FakeBuffer:
+            def iter_with_right_context(self, right_context_size):
+                captured["requested_right_context_size"] = right_context_size
+                if right_context_size == 0:
+                    diar_audio, diar_lengths = asr_audio, asr_lengths
+                else:
+                    diar_audio = torch.randn(1, 80, 112 + right_context_size)
+                    diar_lengths = torch.tensor([112 + right_context_size])
+                captured["diar_audio"] = diar_audio
+                captured["diar_lengths"] = diar_lengths
+                yield asr_audio, asr_lengths, diar_audio, diar_lengths
+
+            def is_buffer_empty(self):
+                return True
+
+        class FakeSpeakerTaggedASR:
+            def __init__(self, cfg, asr_model, diar_model):
+                pass
+
+            def perform_serial_streaming_stt_spk(self, **kwargs):
+                captured["perform_kwargs"] = kwargs
+
+            def perform_parallel_streaming_stt_spk(self, **kwargs):
+                captured["perform_kwargs"] = kwargs
+
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(
+                spk_supervision=spk_supervision,
+                masked_asr=masked_asr,
+                diar_right_context=diar_right_context,
+            )
+        )
+        asr_model = SimpleNamespace(
+            encoder=SimpleNamespace(
+                streaming_cfg=SimpleNamespace(drop_extra_pre_encoded=2),
+            )
+        )
+        diar_model = SimpleNamespace(encoder=SimpleNamespace(subsampling_factor=8))
+        monkeypatch.setattr(streaming_infer, "SpeakerTaggedASR", FakeSpeakerTaggedASR)
+        monkeypatch.setattr(streaming_infer, "autocast", nullcontext(), raising=False)
+
+        launch_fn = (
+            streaming_infer.launch_serial_streaming
+            if strategy == "serial"
+            else streaming_infer.launch_parallel_streaming
+        )
+        launch_fn(
+            cfg=cfg,
+            asr_model=asr_model,
+            diar_model=diar_model,
+            streaming_buffer=FakeBuffer(),
+        )
+
+        expected_right_offset = 0 if spk_supervision == "rttm" else diar_right_context * 8
+        assert captured["requested_right_context_size"] == expected_right_offset
+        assert captured["perform_kwargs"]["chunk_audio"] is asr_audio
+        assert captured["perform_kwargs"]["chunk_lengths"] is asr_lengths
+        assert captured["perform_kwargs"]["diar_chunk_audio"] is captured["diar_audio"]
+        assert captured["perform_kwargs"]["diar_chunk_lengths"] is captured["diar_lengths"]
+        if spk_supervision == "rttm":
+            assert captured["diar_audio"] is asr_audio
+            assert captured["diar_lengths"] is asr_lengths
+
+
+class TestPrepareDiarChunk:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        (
+            "pre_encode_cache_size,drop_extra_pre_encoded,chunk_lengths,expected_shape,"
+            "expected_lengths,expected_first_frame,expected_same_tensor"
+        ),
+        [
+            ([0, 9], 2, (121,), (1, 1, 112), (112,), 9, False),
+            ([0, 9], 0, (121,), (1, 1, 121), (121,), 0, True),
+            (4, 2, (121, 3), (2, 1, 117), (117, 0), 4, False),
+        ],
+    )
+    def test_feature_stacking_removes_asr_preencode_cache(
+        self,
+        pre_encode_cache_size,
+        drop_extra_pre_encoded,
+        chunk_lengths,
+        expected_shape,
+        expected_lengths,
+        expected_first_frame,
+        expected_same_tensor,
+    ):
+        dummy = SimpleNamespace(
+            _diar_uses_feature_stacking=True,
+            asr_model=SimpleNamespace(
+                encoder=SimpleNamespace(
+                    streaming_cfg=SimpleNamespace(pre_encode_cache_size=pre_encode_cache_size),
+                )
+            ),
+        )
+        chunk_audio = torch.arange(len(chunk_lengths) * 121, dtype=torch.float32).reshape(len(chunk_lengths), 1, 121)
+
+        diar_audio, diar_lengths, diar_drop = SpeakerTaggedASR._prepare_diar_chunk(
+            dummy,
+            chunk_audio=chunk_audio,
+            chunk_lengths=torch.tensor(chunk_lengths),
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+        )
+
+        assert diar_audio.shape == expected_shape
+        assert diar_audio[0, 0, 0] == expected_first_frame
+        assert torch.equal(diar_lengths, torch.tensor(expected_lengths))
+        assert diar_drop == 0
+        assert (diar_audio is chunk_audio) is expected_same_tensor
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "chunk_shape,chunk_lengths,drop_extra_pre_encoded",
+        [((1, 128, 121), (121,), 2)],
+    )
+    def test_convolutional_subsampling_keeps_asr_cache_and_drop(
+        self, chunk_shape, chunk_lengths, drop_extra_pre_encoded
+    ):
+        dummy = SimpleNamespace(_diar_uses_feature_stacking=False)
+        chunk_audio = torch.randn(chunk_shape)
+        chunk_lengths = torch.tensor(chunk_lengths)
+
+        diar_audio, diar_lengths, diar_drop = SpeakerTaggedASR._prepare_diar_chunk(
+            dummy,
+            chunk_audio=chunk_audio,
+            chunk_lengths=chunk_lengths,
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+        )
+
+        assert diar_audio is chunk_audio
+        assert diar_lengths is chunk_lengths
+        assert diar_drop == drop_extra_pre_encoded
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("pre_encode_kind", ["feature_stacking", "conv_subsampling"])
+    @pytest.mark.parametrize("diar_right_context", [0, 1, 3, 5, 13])
+    @pytest.mark.parametrize("is_first_chunk", [True, False])
+    def test_actual_pre_encode_preserves_central_and_future_frames(
+        self, pre_encode_kind, diar_right_context, is_first_chunk
+    ):
+        frontend_encoder = "transformer" if pre_encode_kind == "feature_stacking" else "conformer"
+        diar_model = _create_sortformer_model(frontend_encoder=frontend_encoder).eval()
+        cache_size = 0 if is_first_chunk else 9
+        central_mel_frames = 105 if is_first_chunk else 112
+        drop_extra_pre_encoded = 0 if is_first_chunk else 2
+        input_frames = cache_size + central_mel_frames + diar_right_context * 8
+        dummy = SimpleNamespace(
+            _diar_uses_feature_stacking=pre_encode_kind == "feature_stacking",
+            asr_model=SimpleNamespace(
+                encoder=SimpleNamespace(
+                    streaming_cfg=SimpleNamespace(pre_encode_cache_size=[0, 9]),
+                )
+            ),
+        )
+        chunk_audio = torch.randn(1, diar_model.encoder._feat_in, input_frames)
+
+        diar_audio, diar_lengths, diar_drop = SpeakerTaggedASR._prepare_diar_chunk(
+            dummy,
+            chunk_audio=chunk_audio,
+            chunk_lengths=torch.tensor([input_frames]),
+            drop_extra_pre_encoded=drop_extra_pre_encoded,
+        )
+        pre_encoded, pre_encoded_lengths = diar_model._call_pre_encode(diar_audio.transpose(1, 2), diar_lengths)
+        if diar_drop:
+            pre_encoded = pre_encoded[:, diar_drop:]
+            pre_encoded_lengths = pre_encoded_lengths - diar_drop
+
+        expected_frames = 14 + diar_right_context
+        assert pre_encoded.shape[1] == expected_frames
+        assert pre_encoded_lengths.tolist() == [expected_frames]
+
+
+class TestDiarizationStreamingRouting:
+    @pytest.mark.unit
+    @pytest.mark.parametrize("diar_right_context", [0, 1, 3, 5, 13])
+    def test_forward_passes_wider_view_and_fixed_right_offset(self, diar_right_context):
+        captured = {}
+        diar_audio = torch.randn(2, 80, 112 + diar_right_context * 8)
+        diar_lengths = torch.tensor([diar_audio.shape[-1], diar_audio.shape[-1] - 8])
+        streaming_state = object()
+        total_preds = torch.zeros(2, 0, 4)
+
+        def forward_streaming_step(**kwargs):
+            captured.update(kwargs)
+            return streaming_state, total_preds
+
+        dummy = SimpleNamespace(
+            _diar_right_offset=diar_right_context * 8,
+            _prepare_diar_chunk=lambda audio, lengths, drop: (audio, lengths, drop),
+            diar_model=SimpleNamespace(forward_streaming_step=forward_streaming_step),
+            instance_manager=SimpleNamespace(
+                diar_states=SimpleNamespace(
+                    streaming_state=streaming_state,
+                    diar_pred_out_stream=total_preds,
+                )
+            ),
+        )
+
+        SpeakerTaggedASR._forward_diarization_streaming_step(
+            dummy,
+            diar_chunk_audio=diar_audio,
+            diar_chunk_lengths=diar_lengths,
+            drop_extra_pre_encoded=2,
+        )
+
+        torch.testing.assert_close(captured["processed_signal"], diar_audio.transpose(1, 2))
+        assert captured["processed_signal"].data_ptr() == diar_audio.data_ptr()
+        assert captured["processed_signal_length"] is diar_lengths
+        assert captured["drop_extra_pre_encoded"] == 2
+        assert captured["right_offset"] == diar_right_context * 8
+
+
+class TestParallelASRStateTimestamps:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "initial_decoded_length,next_decoded_length,next_timestamp,offset,expected_start,expected_end",
+        [(14, 28, 15, 1.12, 1.20, 1.28)],
+    )
+    def test_decoded_length_advances_when_chunk_has_no_new_text(
+        self,
+        initial_decoded_length,
+        next_decoded_length,
+        next_timestamp,
+        offset,
+        expected_start,
+        expected_end,
+    ):
+        asr_state = MultiTalkerInstanceManager.ASRState(max_num_of_spks=1, uppercase_first_letter=False)
+        asr_state.speakers = [0]
+        asr_state.previous_hypothesis = [
+            Hypothesis(
+                score=0.0,
+                y_sequence=[],
+                text="",
+                timestamp=torch.empty(0, dtype=torch.long),
+                dec_state=SimpleNamespace(decoded_length=torch.tensor(initial_decoded_length)),
+                length=torch.tensor(0),
+            )
+        ]
+
+        asr_state.update_sessionwise_seglsts_for_parallel(offset=0.0)
+
+        assert asr_state._prev_decoded_lengths[0] == initial_decoded_length
+
+        asr_state.previous_hypothesis = [
+            Hypothesis(
+                score=0.0,
+                y_sequence=[1],
+                text="hello",
+                timestamp=torch.tensor([next_timestamp]),
+                dec_state=SimpleNamespace(decoded_length=torch.tensor(next_decoded_length)),
+                length=torch.tensor(1),
+            )
+        ]
+        asr_state.update_sessionwise_seglsts_for_parallel(offset=offset)
+
+        assert asr_state.seglsts[0]["start_time"] == pytest.approx(expected_start)
+        assert asr_state.seglsts[0]["end_time"] == pytest.approx(expected_end)
 
 
 class TestWriteSeglst:
@@ -292,7 +716,214 @@ class TestWriteSeglst:
         assert content == json.dumps(seglst, indent=2) + "\n"
 
 
+class TestWriteDiarPredictionsToRttm:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "audio_filepath,prediction_shape,active_regions,feature_length,expected_lines",
+        [
+            (
+                "/audio/session.wav",
+                (1, 6, 2),
+                ((1, 3, 0, 0.9), (3, 6, 1, 0.8)),
+                40,
+                (
+                    "SPEAKER session 1 0.080 0.160 <NA> <NA> speaker_0 <NA> <NA>",
+                    "SPEAKER session 1 0.240 0.160 <NA> <NA> speaker_1 <NA> <NA>",
+                ),
+            )
+        ],
+    )
+    def test_writes_contiguous_segments_and_ignores_batch_padding(
+        self,
+        tmp_path,
+        audio_filepath,
+        prediction_shape,
+        active_regions,
+        feature_length,
+        expected_lines,
+    ):
+        diar_preds = torch.zeros(prediction_shape)
+        for start, end, speaker, score in active_regions:
+            diar_preds[0, start:end, speaker] = score
+        output_dir = tmp_path / "rttms"
+
+        predictions, metadata = collect_diar_predictions(
+            diar_preds=diar_preds,
+            samples=[{"audio_filepath": audio_filepath}],
+            feature_lengths=torch.tensor([feature_length]),
+            feature_frame_length_sec=0.01,
+            diar_frame_length_sec=0.08,
+        )
+        cfg = SimpleNamespace(
+            diar_output_rttm_dir=str(output_dir),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
+        )
+        write_and_score_diar_predictions(
+            predictions=predictions,
+            samples=metadata,
+            cfg=cfg,
+            output_subsampling_factor=8,
+        )
+
+        assert (output_dir / "session.rttm").read_text(encoding="utf-8").splitlines() == list(expected_lines)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "samples,expected_recording_ids",
+        [
+            (
+                (
+                    {"audio_filepath": "/dataset/a/first.wav", "duration": 0.16, "offset": 0.0},
+                    {"audio_filepath": "/dataset/b/second.wav", "duration": 0.16, "offset": 0.0},
+                ),
+                ("first", "second"),
+            ),
+            (
+                (
+                    {
+                        "audio_filepath": "/dataset/a/session.wav",
+                        "uniq_id": "session_a",
+                        "duration": 0.16,
+                        "offset": 0.0,
+                    },
+                    {
+                        "audio_filepath": "/dataset/b/session.wav",
+                        "uniq_id": "session_b",
+                        "duration": 0.16,
+                        "offset": 0.0,
+                    },
+                ),
+                ("session_a", "session_b"),
+            ),
+        ],
+    )
+    def test_distinct_recording_ids_write_distinct_rttms(self, tmp_path, samples, expected_recording_ids):
+        output_dir = tmp_path / "rttms"
+        predictions = [torch.full((1, 2, 1), 0.9) for _ in samples]
+        cfg = SimpleNamespace(
+            diar_output_rttm_dir=str(output_dir),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
+        )
+
+        write_and_score_diar_predictions(
+            predictions=predictions,
+            samples=[dict(sample) for sample in samples],
+            cfg=cfg,
+            output_subsampling_factor=8,
+        )
+
+        assert sorted(path.stem for path in output_dir.glob("*.rttm")) == sorted(expected_recording_ids)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "samples,duplicate_id",
+        [
+            (
+                (
+                    {"audio_filepath": "/dataset/a/session.wav"},
+                    {"audio_filepath": "/dataset/b/session.wav"},
+                ),
+                "session",
+            ),
+            (
+                (
+                    {"audio_filepath": "/dataset/a/first.wav", "uniq_id": "shared"},
+                    {"audio_filepath": "/dataset/b/second.wav", "uniq_id": "shared"},
+                ),
+                "shared",
+            ),
+        ],
+    )
+    def test_duplicate_recording_ids_raise_value_error(self, tmp_path, samples, duplicate_id):
+        cfg = SimpleNamespace(
+            diar_output_rttm_dir=str(tmp_path / "rttms"),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
+        )
+
+        with pytest.raises(ValueError, match=f"Duplicate recording ID '{duplicate_id}'") as error:
+            write_and_score_diar_predictions(
+                predictions=[torch.zeros(1, 1, 1) for _ in samples],
+                samples=[dict(sample) for sample in samples],
+                cfg=cfg,
+                output_subsampling_factor=8,
+            )
+
+        for sample in samples:
+            assert sample["audio_filepath"] in str(error.value)
+
+
 class TestGetMultiTalkerSamplesFromManifest:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "all_masks_shape,batch_start,batch_size,expected_start,expected_end",
+        [((5, 4, 2), 2, 2, 2, 4)],
+    )
+    def test_set_batch_rttm_masks_selects_current_audio_batch(
+        self, all_masks_shape, batch_start, batch_size, expected_start, expected_end
+    ):
+        class DummyDiarModel:
+            rttms_mask_mats = None
+
+        diar_model = DummyDiarModel()
+        all_masks = torch.arange(math.prod(all_masks_shape)).reshape(all_masks_shape)
+
+        set_batch_rttm_masks(
+            diar_model=diar_model,
+            rttms_mask_mats=all_masks,
+            batch_start=batch_start,
+            batch_size=batch_size,
+            device=torch.device("cpu"),
+        )
+
+        assert torch.equal(diar_model.rttms_mask_mats, all_masks[expected_start:expected_end])
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "rttm_line,duration,feat_per_sec,max_spks,expected_first_speaker_mask",
+        [
+            (
+                "SPEAKER sample 1 0.16 0.16 <NA> <NA> speaker_A <NA> <NA>\n",
+                1.0,
+                0.08,
+                2,
+                (0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            )
+        ],
+    )
+    def test_rttm_targets_align_with_nonoverlapping_output_frames(
+        self,
+        tmp_path,
+        rttm_line,
+        duration,
+        feat_per_sec,
+        max_spks,
+        expected_first_speaker_mask,
+    ):
+        rttm_path = tmp_path / "sample.rttm"
+        rttm_path.write_text(rttm_line, encoding="utf-8")
+        manifest_path = tmp_path / "manifest.jsonl"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "audio_filepath": "sample.wav",
+                    "duration": duration,
+                    "rttm_filepath": str(rttm_path),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        cfg = OmegaConf.structured(MultitalkerTranscriptionConfig(spk_supervision="rttm"))
+
+        _, rttm_masks = get_multi_talker_samples_from_manifest(
+            cfg, str(manifest_path), feat_per_sec=feat_per_sec, max_spks=max_spks
+        )
+
+        assert torch.equal(rttm_masks[0, :, 0], torch.tensor(expected_first_speaker_mask))
+
     @pytest.mark.unit
     def test_missing_audio_filepath(self, tmp_path):
         mpath = tmp_path / "manifest.jsonl"
@@ -318,6 +949,50 @@ class TestGetMultiTalkerSamplesFromManifest:
 
 class TestSpeakerTaggedASRInit:
     """Test the initialization of SpeakerTaggedASR class"""
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("diar_right_context", [0, 1, 3, 5, 13])
+    def test_init_converts_diar_right_context_to_input_frames(
+        self, asr_model, diar_model, tmp_path, diar_right_context
+    ):
+        audio_path = tmp_path / "test.wav"
+        audio_path.touch()
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(
+                audio_file=str(audio_path),
+                diar_right_context=diar_right_context,
+                batch_size=1,
+            )
+        )
+
+        speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
+
+        assert speaker_tagged_asr._diar_right_offset == diar_right_context * diar_model.encoder.subsampling_factor
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "valid_out_len,cache_drop_size,expected_block_frame_length",
+        [(10, 4, 14)],
+    )
+    def test_init_separates_frame_hop_from_block_length(
+        self, asr_model, diar_model, tmp_path, valid_out_len, cache_drop_size, expected_block_frame_length
+    ):
+        audio_path = tmp_path / "test.wav"
+        audio_path.touch()
+        asr_model.encoder.streaming_cfg.valid_out_len = valid_out_len
+        asr_model.encoder.streaming_cfg.cache_drop_size = cache_drop_size
+        cfg = OmegaConf.structured(
+            MultitalkerTranscriptionConfig(
+                audio_file=str(audio_path),
+                att_context_size=[70, 13],
+                batch_size=1,
+            )
+        )
+
+        speaker_tagged_asr = SpeakerTaggedASR(cfg, asr_model, diar_model)
+
+        assert speaker_tagged_asr._frame_hop_length == valid_out_len
+        assert speaker_tagged_asr._nframes_per_chunk == expected_block_frame_length
 
     @pytest.mark.unit
     def test_init_default_config_values(self, asr_model, diar_model, tmp_path):
