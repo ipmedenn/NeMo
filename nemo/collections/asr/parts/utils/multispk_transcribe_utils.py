@@ -1633,12 +1633,12 @@ class MultiTalkerInstanceManager:
             """
             if text is None or text == self._prev_history_speaker_texts[spk_idx]:
                 return None
-            else:
-                # Get the difference between the current text and the previous text
-                if self._prev_history_speaker_texts[spk_idx] in text:
-                    return text.replace(self._prev_history_speaker_texts[spk_idx], "")
-                else:
-                    return text.strip()
+            previous_text = self._prev_history_speaker_texts[spk_idx]
+            # Extract only the newly appended suffix for a true cumulative prefix extension.
+            if text.startswith(previous_text):
+                return text[len(previous_text) :]
+            # Preserve the existing fallback for a non-prefix hypothesis revision.
+            return text.strip()
 
         def _compute_hypothesis_timestamps(
             self,
@@ -1706,9 +1706,9 @@ class MultiTalkerInstanceManager:
                 if spk_idx not in self._speaker_wise_sentences:
                     self._speaker_wise_sentences[spk_idx] = []
 
+                previous_text = self._prev_history_speaker_texts[spk_idx]
                 diff_text = self._is_new_text(spk_idx=spk_idx, text=hypothesis.text)
                 if diff_text is not None:
-
                     start_time, end_time, sep_flag = self._compute_hypothesis_timestamps(
                         hypothesis=hypothesis,
                         offset=offset,
@@ -1716,21 +1716,32 @@ class MultiTalkerInstanceManager:
                         decoded_length_before=self._prev_decoded_lengths[spk_idx],
                     )
 
-                    # Get the last end time of the previous sentence or None if no sentences are present
+                    # Get the last end time of the previous sentence or zero when no sentence is present.
                     if len(self._speaker_wise_sentences[spk_idx]) > 0:
                         last_end_time = self._speaker_wise_sentences[spk_idx][-1]['end_time']
                     else:
                         last_end_time = 0.0
 
-                    # Case 1 - If start_tiime is greater than end_time + sent_break_sec, then we need to add the sentence
-                    if sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
+                    # A non-whitespace join continues the previous word and must not start a segment.
+                    is_prefix_extension = bool(previous_text) and hypothesis.text.startswith(previous_text)
+                    continues_previous_word = (
+                        is_prefix_extension
+                        and bool(diff_text)
+                        and not previous_text[-1].isspace()
+                        and not diff_text[0].isspace()
+                        and bool(self._speaker_wise_sentences[spk_idx])
+                    )
+                    if continues_previous_word:
+                        self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
+                    # Case 1: At a valid boundary, start a segment when the timing threshold requires one.
+                    elif sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
                         stripped_text = diff_text.strip()
                         if len(stripped_text) > 0 and stripped_text[0] in ['.', ',', '?', '!']:
-                            # This handles the case where the first character should be assigned to the previous sentence.
+                            # Attach leading punctuation to the preceding sentence instead of creating its own segment.
                             the_first_char, diff_text = stripped_text[0], stripped_text[1:]
                             self._update_last_sentence(spk_idx=spk_idx, end_time=None, diff_text=the_first_char)
 
-                        # Add the sentence to the speaker-wise sentences only if the text is not empty.
+                        # Add the remaining suffix only when it contains non-whitespace text.
                         a_seg_dict = get_new_sentence_dict(
                             speaker=f"speaker_{spk_idx}", start_time=start_time, end_time=end_time, text=diff_text
                         )
@@ -1740,7 +1751,7 @@ class MultiTalkerInstanceManager:
                                 split_words[0] = split_words[0].capitalize()
                                 a_seg_dict['words'] = ' '.join(split_words)
                             self._speaker_wise_sentences[spk_idx].append(a_seg_dict)
-                    # Case 2 - If start_time is less than end_time + sent_break_sec, then we need to update the end_time
+                    # Case 2: At a valid boundary without a long gap, extend the current segment.
                     else:
                         self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
 

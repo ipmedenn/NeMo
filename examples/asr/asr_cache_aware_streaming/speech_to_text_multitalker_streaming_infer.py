@@ -106,7 +106,7 @@ class MultitalkerTranscriptionConfig:
     # Multitalker transcription configs
     verbose: bool = False
     word_window: int = 50
-    sent_break_sec: float = 30.0
+    sent_break_sec: float = 0.25 # minimum time gap between sentences
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1

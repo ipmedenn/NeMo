@@ -50,6 +50,30 @@ from tests.collections.speaker_tasks.test_diar_sortformer_models import _create_
 from tests.collections.speaker_tasks.test_diar_sortformer_models import sortformer_model as diar_model
 
 
+def make_character_hypothesis(text, timestamps):
+    return Hypothesis(
+        score=0.0,
+        y_sequence=[ord(char) for char in text],
+        text=text,
+        timestamp=torch.tensor(timestamps, dtype=torch.long),
+        dec_state=SimpleNamespace(decoded_length=torch.tensor(max(timestamps, default=-1) + 1)),
+        length=torch.tensor(len(timestamps)),
+    )
+
+
+def run_parallel_hypothesis_updates(updates, sent_break_sec):
+    state = MultiTalkerInstanceManager.ASRState(
+        max_num_of_spks=1,
+        sent_break_sec=sent_break_sec,
+        uppercase_first_letter=False,
+    )
+    state.speakers = [0]
+    for text, timestamps, offset in updates:
+        state.previous_hypothesis = [make_character_hypothesis(text, timestamps)]
+        state.update_sessionwise_seglsts_for_parallel(offset=offset)
+    return state
+
+
 @pytest.fixture()
 def asr_model(offline_asr_model):
     """Wrapper fixture that adds streaming_cfg to the asr_model from test_asr_rnnt_encoder_model_bpe"""
@@ -653,6 +677,130 @@ class TestDiarizationStreamingRouting:
         assert captured["processed_signal_length"] is diar_lengths
         assert captured["drop_extra_pre_encoded"] == 2
         assert captured["right_offset"] == diar_right_context * 8
+
+
+class TestParallelWordAwareSegmentation:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "previous_text,current_text,expected_delta",
+        [
+            ("go go", "go go now", " now"),
+            ("turn left", "turn right", "turn right"),
+            ("same", "same", None),
+        ],
+    )
+    def test_text_delta_uses_prefix_slicing_and_preserves_non_prefix_fallback(
+        self, previous_text, current_text, expected_delta
+    ):
+        state = MultiTalkerInstanceManager.ASRState(max_num_of_spks=1)
+        state._prev_history_speaker_texts[0] = previous_text
+
+        assert state._is_new_text(spk_idx=0, text=current_text) == expected_delta
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "updates,expected_text",
+        [
+            (
+                [
+                    ("Lind", [0, 1, 2, 3], 0.0),
+                    ("Linda", [0, 1, 2, 3, 30], 2.0),
+                ],
+                "Linda",
+            ),
+            (
+                [
+                    ("Don", [0, 1, 2], 0.0),
+                    ("Don't start", [0, 1, 2, 30, 31, 32, 40, 41, 42, 43, 44], 2.0),
+                ],
+                "Don't start",
+            ),
+        ],
+    )
+    def test_word_continuations_never_create_segment_boundaries(self, updates, expected_text):
+        state = run_parallel_hypothesis_updates(updates, sent_break_sec=0.1)
+
+        exported_text = " ".join(segment["words"] for segment in state.seglsts)
+
+        assert exported_text == expected_text
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "updates,expected_segments",
+        [
+            (
+                [
+                    ("hello", [0, 1, 2, 3, 4], 0.0),
+                    ("hello world", [0, 1, 2, 3, 4, 5, 30, 31, 32, 33, 34], 2.0),
+                ],
+                ("hello", "world"),
+            ),
+            (
+                [
+                    ("hello ", [0, 1, 2, 3, 4, 5], 0.0),
+                    ("hello world", [0, 1, 2, 3, 4, 5, 30, 31, 32, 33, 34], 2.0),
+                ],
+                ("hello", "world"),
+            ),
+        ],
+    )
+    def test_clean_word_boundary_can_create_segment(self, updates, expected_segments):
+        state = run_parallel_hypothesis_updates(updates, sent_break_sec=0.5)
+
+        assert tuple(segment["words"].strip() for segment in state.seglsts) == expected_segments
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "updates,expected_text",
+        [
+            (
+                [
+                    ("hello", [0, 1, 2, 3, 4], 0.0),
+                    ("hello,", [0, 1, 2, 3, 4, 20], 1.0),
+                    ("hello, world", [0, 1, 2, 3, 4, 20, 21, 30, 31, 32, 33, 34], 2.0),
+                ],
+                "hello, world",
+            ),
+            (
+                [
+                    ("go go", [0, 1, 2, 3, 4], 0.0),
+                    ("go go now", [0, 1, 2, 3, 4, 5, 20, 21, 22], 1.0),
+                ],
+                "go go now",
+            ),
+        ],
+    )
+    def test_punctuation_and_repeated_prefixes_preserve_text(self, updates, expected_text):
+        state = run_parallel_hypothesis_updates(updates, sent_break_sec=0.1)
+
+        exported_text = " ".join(segment["words"] for segment in state.seglsts)
+
+        assert exported_text == expected_text
+        assert all(segment["words"] not in {",", ".", "!", "?"} for segment in state.seglsts)
+
+    @pytest.mark.unit
+    def test_word_stream_is_invariant_while_segment_layout_changes_with_threshold(self):
+        updates = [
+            ("Lind", [0, 1, 2, 3], 0.0),
+            ("Linda", [0, 1, 2, 3, 30], 2.0),
+            ("Linda next", [0, 1, 2, 3, 30, 60, 61, 62, 63, 64], 4.08),
+        ]
+        layouts = {}
+        for sent_break_sec in [30.0, 1.0, 0.5, 0.1, 0.0]:
+            state = run_parallel_hypothesis_updates(updates, sent_break_sec=sent_break_sec)
+            segments = state.seglsts
+            layouts[sent_break_sec] = tuple(segment["words"].strip() for segment in segments)
+            normalized_words = " ".join(segment["words"] for segment in segments).split()
+
+            assert normalized_words == ["Linda", "next"]
+            assert all(segment["start_time"] <= segment["end_time"] for segment in segments)
+            assert [segment["start_time"] for segment in segments] == sorted(
+                segment["start_time"] for segment in segments
+            )
+
+        assert len(set(layouts.values())) >= 2
+        assert layouts[30.0] == ("Linda next",)
+        assert layouts[0.0] == ("Linda", "next")
 
 
 class TestParallelASRStateTimestamps:
