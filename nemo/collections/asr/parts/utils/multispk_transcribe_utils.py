@@ -137,7 +137,24 @@ def write_seglst_file(seglst_dict_list: List[Dict[str, Any]], output_path: str):
 
 
 def get_aligned_rttm_mask(feat_level_target: torch.Tensor, num_frames: int, stride: int) -> torch.Tensor:
-    """Average non-overlapping fine-grained RTTM targets into output-frame-aligned bins."""
+    """
+    Average non-overlapping fine-grained RTTM targets into output-frame-aligned bins.
+
+    The input is truncated when longer than ``num_frames * stride`` and zero-padded when shorter, then averaged in
+    non-overlapping groups.
+
+    Args:
+        feat_level_target (torch.Tensor): Fine-resolution RTTM target with shape
+            ``(feature_frames, speakers)``.
+        num_frames (int): Desired number of output frames.
+        stride (int): Number of fine-resolution frames averaged into each output frame.
+
+    Returns:
+        aligned_target (torch.Tensor): Averaged RTTM target with shape ``(num_frames, speakers)``.
+
+    Raises:
+        ValueError: If ``stride`` is less than one.
+    """
     if stride < 1:
         raise ValueError(f"stride must be positive, but received {stride}")
 
@@ -1034,7 +1051,25 @@ class SpeakerTaggedASR:
         return audio_signal, length
 
     def _prepare_diar_chunk(self, chunk_audio, chunk_lengths, drop_extra_pre_encoded):
-        """Adapt an ASR cache-aware chunk to the diarization model's pre-encoder geometry."""
+        """
+        Adapt an ASR cache-aware chunk to the diarization model's pre-encoder geometry.
+
+        Convolutional-subsampling diarizers receive the original values unchanged. FeatureStacking diarizers remove
+        the ASR-only raw pre-encoder cache, adjust the valid lengths, and use a diarization drop count of zero.
+
+        Args:
+            chunk_audio (torch.Tensor): Cache-aware input features with shape ``(batch, feature, time)``.
+            chunk_lengths (torch.Tensor): Per-row valid lengths measured in input-feature frames.
+            drop_extra_pre_encoded (int): ASR pre-encoder cache/drop indicator used to select the effective cache
+                geometry.
+
+        Returns:
+            diar_chunk (tuple): A three-item tuple containing the diarization feature view, its adjusted valid
+                lengths, and the drop count passed to the diarization pre-encoder.
+
+        Raises:
+            ValueError: If a FeatureStacking chunk is not longer than the cache region that must be removed.
+        """
         if not self._diar_uses_feature_stacking:
             return chunk_audio, chunk_lengths, drop_extra_pre_encoded
 

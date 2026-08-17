@@ -123,7 +123,21 @@ class MultitalkerTranscriptionConfig:
 
 
 def set_batch_rttm_masks(diar_model, rttms_mask_mats, batch_start: int, batch_size: int, device: torch.device):
-    """Attach only the ground-truth diarization masks corresponding to the current audio batch."""
+    """
+    Attach only the ground-truth diarization masks corresponding to the current audio batch.
+
+    The selected masks replace the model's current batch masks; they are not appended.
+
+    Args:
+        diar_model (SortformerEncLabelModel): Model whose ``rttms_mask_mats`` value is replaced for this batch.
+        rttms_mask_mats (torch.Tensor): Complete tensor of reference diarization masks.
+        batch_start (int): Starting sample index in ``rttms_mask_mats``.
+        batch_size (int): Number of masks required for the current audio batch.
+        device (torch.device): Destination device for the selected masks.
+
+    Raises:
+        ValueError: If the requested slice contains fewer than ``batch_size`` masks.
+    """
     batch_rttm_masks = rttms_mask_mats[batch_start : batch_start + batch_size]
     if batch_rttm_masks.shape[0] != batch_size:
         raise ValueError(
@@ -140,7 +154,26 @@ def collect_diar_predictions(
     feature_frame_length_sec: float,
     diar_frame_length_sec: float,
 ):
-    """Collect valid, unpadded diarization predictions and their metadata."""
+    """
+    Collect valid, unpadded diarization predictions and their metadata.
+
+    A missing manifest duration is derived as ``feature_lengths * feature_frame_length_sec``.
+
+    Args:
+        diar_preds (torch.Tensor): Diarization predictions whose leading dimension is the current batch size.
+        samples (list): Metadata dictionaries corresponding to the rows of ``diar_preds``.
+        feature_lengths (torch.Tensor): Per-recording valid lengths measured in input-feature frames.
+        feature_frame_length_sec (float): Duration in seconds of one input-feature frame.
+        diar_frame_length_sec (float): Duration in seconds represented by one diarization output frame.
+
+    Returns:
+        predictions_and_metadata (tuple): A two-item tuple containing a list of CPU prediction tensors trimmed to
+            each recording's valid duration and copied metadata dictionaries with resolved ``duration`` values and
+            a default ``offset`` of zero.
+
+    Raises:
+        ValueError: If the prediction, sample, and feature-length batch sizes disagree.
+    """
     if diar_preds.shape[0] != len(samples) or len(samples) != len(feature_lengths):
         raise ValueError(
             f"Batch size mismatch: diar_preds={diar_preds.shape[0]}, samples={len(samples)}, "
@@ -168,7 +201,23 @@ def collect_diar_predictions(
 
 
 def write_and_score_diar_predictions(predictions, samples, cfg, output_subsampling_factor):
-    """Convert predictions with the standalone e2e path, write RTTMs, and score when references exist."""
+    """
+    Convert predictions with the standalone e2e path, write RTTMs, and score when references exist.
+
+    Each recording ID is resolved from a non-empty ``uniq_id`` or, when unavailable, from the audio filename stem.
+    RTTM files are written when an output directory is configured, and DER is calculated only when every reference
+    RTTM file exists.
+
+    Args:
+        predictions (list): One diarization prediction tensor per recording.
+        samples (list): Metadata dictionaries corresponding to ``predictions``.
+        cfg (MultitalkerTranscriptionConfig): Output-directory and DER-scoring configuration.
+        output_subsampling_factor (int): Number of 10 ms feature frames represented by one diarization output frame.
+
+    Raises:
+        ValueError: If prediction and metadata counts differ, recording IDs are duplicated, or the resolved
+            recording IDs are otherwise inconsistent with the predictions.
+    """
     if len(predictions) != len(samples):
         raise ValueError(
             f"Expected one metadata entry per prediction, but found {len(samples)} samples "
@@ -230,6 +279,11 @@ def configure_diar_streaming(diar_model, cfg, output_subsampling_factor: int, di
 
     Returns:
         effective_output_factor (int): Validated number of 10 ms feature frames represented by each output frame.
+
+    Raises:
+        TypeError: If ``diar_right_context`` is not an integer or is a boolean.
+        ValueError: If right context is negative, the diarization output resolution cannot match the ASR output
+            resolution, or the resulting streaming geometry fails model validation.
     """
     if not isinstance(cfg.diar_right_context, int) or isinstance(cfg.diar_right_context, bool):
         raise TypeError("diar_right_context must be an integer.")
