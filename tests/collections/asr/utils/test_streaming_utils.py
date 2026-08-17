@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import nemo.collections.asr.parts.utils.streaming_utils as streaming_utils
+from nemo.collections.asr.parts.utils import streaming_utils
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 
 

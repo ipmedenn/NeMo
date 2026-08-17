@@ -17,9 +17,9 @@ import math
 from contextlib import nullcontext
 from types import SimpleNamespace
 
-import examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer as streaming_infer
 import pytest
 import torch
+from examples.asr.asr_cache_aware_streaming import speech_to_text_multitalker_streaming_infer as streaming_infer
 from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import (
     MultitalkerTranscriptionConfig,
     collect_diar_predictions,
