@@ -54,7 +54,7 @@ class MultitalkerTranscriptionConfig:
     diar_pretrained_name: Optional[str] = None  # Name of a pretrained model
     max_num_of_spks: Optional[int] = 4  # maximum number of speakers
     parallel_speaker_strategy: bool = True  # whether to use parallel speaker strategy
-    masked_asr: bool = True  # whether to use masked ASR
+    masked_asr: bool = False  # whether to use masked ASR
     mask_preencode: bool = False  # whether to mask preencode or mask features
     cache_gating: bool = True  # whether to use cache gating
     cache_gating_buffer_size: int = 2  # buffer size for cache gating
@@ -70,7 +70,7 @@ class MultitalkerTranscriptionConfig:
 
     # Streaming diarization configs
     streaming_mode: bool = True  # If True, streaming diarization will be used.
-    spkcache_len: int = 188
+    spkcache_len: Optional[int] = None
     spkcache_update_period: int = 144
     fifo_len: int = 188
     diar_right_context: int = 0  # extra right context size for diarization (will increase total latency)
@@ -101,12 +101,12 @@ class MultitalkerTranscriptionConfig:
     pad_and_drop_preencoded: bool = False
     generate_realtime_scripts: bool = False
     spk_supervision: str = "diar"  # ["diar", "rttm"]
-    binary_diar_preds: bool = False
+    binary_diar_preds: bool = True
 
     # Multitalker transcription configs
     verbose: bool = False
     word_window: int = 50
-    sent_break_sec: float = 0.25 # minimum time gap between sentences
+    sent_break_sec: float = 0.25  # minimum time gap between sentences
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1
@@ -237,7 +237,8 @@ def configure_diar_streaming(diar_model, cfg, output_subsampling_factor: int, di
         raise ValueError("diar_right_context must be non-negative.")
 
     diar_model.streaming_mode = cfg.streaming_mode
-    diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
+    if cfg.spkcache_len is not None:
+        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
     diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
     diar_model.sortformer_modules.fifo_len = cfg.fifo_len
     diar_model.sortformer_modules.log = cfg.log

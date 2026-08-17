@@ -1317,6 +1317,9 @@ class SpeakerTaggedASR:
             self.instance_manager.reset(batch_size=chunk_audio.shape[0])
             self.instance_manager.to(chunk_audio.device)
 
+        current_chunk_start_time = self._offset_chunk_start_time
+        self._offset_chunk_start_time += self._frame_hop_length * self._frame_len_sec
+
         # Step 2: diarize or get GT rttms
         if self.diar_model.rttms_mask_mats is None:
             diar_chunk_audio = chunk_audio if diar_chunk_audio is None else diar_chunk_audio
@@ -1445,8 +1448,7 @@ class SpeakerTaggedASR:
                 active_id += 1
 
         # Step 9: update seglsts with timestamps
-        self.instance_manager.update_seglsts(offset=self._offset_chunk_start_time)
-        self._offset_chunk_start_time += self._frame_hop_length * self._frame_len_sec
+        self.instance_manager.update_seglsts(offset=current_chunk_start_time)
 
         if self.cfg.get("generate_realtime_scripts", True):
             for session_idx in self.cfg.get("print_sample_indices", [0]):
@@ -1722,6 +1724,8 @@ class MultiTalkerInstanceManager:
                     else:
                         last_end_time = 0.0
 
+                    has_time_gap = last_end_time != 0.0 and start_time > last_end_time + self._sent_break_sec
+
                     # A non-whitespace join continues the previous word and must not start a segment.
                     is_prefix_extension = bool(previous_text) and hypothesis.text.startswith(previous_text)
                     continues_previous_word = (
@@ -1731,10 +1735,16 @@ class MultiTalkerInstanceManager:
                         and not diff_text[0].isspace()
                         and bool(self._speaker_wise_sentences[spk_idx])
                     )
+                    if continues_previous_word and has_time_gap:
+                        word_suffix, separator, remaining_text = diff_text.partition(" ")
+                        self._update_last_sentence(spk_idx=spk_idx, end_time=None, diff_text=word_suffix)
+                        diff_text = separator + remaining_text
+                        continues_previous_word = False
+
                     if continues_previous_word:
                         self._update_last_sentence(spk_idx=spk_idx, end_time=end_time, diff_text=diff_text)
                     # Case 1: At a valid boundary, start a segment when the timing threshold requires one.
-                    elif sep_flag or (last_end_time == 0.0 or start_time > last_end_time + self._sent_break_sec):
+                    elif sep_flag or last_end_time == 0.0 or has_time_gap:
                         stripped_text = diff_text.strip()
                         if len(stripped_text) > 0 and stripped_text[0] in ['.', ',', '?', '!']:
                             # Attach leading punctuation to the preceding sentence instead of creating its own segment.
@@ -2008,7 +2018,7 @@ class MultiTalkerInstanceManager:
                 self._active_chunk_audio.append(chunk_audio[batch_idx, :])
                 self._active_chunk_lengths.append(chunk_lengths[batch_idx])
                 self._active_speaker_targets.append(self.diar_states.previous_chunk_preds[batch_idx, :, speaker_id])
-                inactive_speaker_ids = [i for i in range(len(speaker_ids)) if i != speaker_id]
+                inactive_speaker_ids = [other_id for other_id in speaker_ids if other_id != speaker_id]
                 self._inactive_speaker_targets.append(
                     (self.diar_states.previous_chunk_preds[batch_idx, :, inactive_speaker_ids] > 0.5).sum(dim=-1) > 0
                 )

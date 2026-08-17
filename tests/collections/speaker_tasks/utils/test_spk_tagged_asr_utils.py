@@ -398,6 +398,17 @@ class TestConfigureDiarStreaming:
         assert diar_model.sortformer_modules.chunk_right_context == 0
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("spkcache_len", [None, 256])
+    def test_spkcache_len_is_an_optional_model_override(self, diar_model, spkcache_len):
+        original_spkcache_len = diar_model.sortformer_modules.spkcache_len
+        cfg = MultitalkerTranscriptionConfig(spkcache_len=spkcache_len)
+
+        configure_diar_streaming(diar_model, cfg, output_subsampling_factor=8)
+
+        expected_spkcache_len = original_spkcache_len if spkcache_len is None else spkcache_len
+        assert diar_model.sortformer_modules.spkcache_len == expected_spkcache_len
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("asr_output_subsampling_factor,diar_chunk_len", [(8, 14)])
     def test_aligns_high_resolution_diarizer_to_asr_factor(self, asr_output_subsampling_factor, diar_chunk_len):
         diar_model = _create_sortformer_model(
@@ -679,6 +690,97 @@ class TestDiarizationStreamingRouting:
         assert captured["right_offset"] == diar_right_context * 8
 
 
+class TestParallelStreamingCacheGating:
+    @pytest.mark.unit
+    def test_timestamp_offset_advances_once_for_empty_and_active_steps(self):
+        frame_hop_length = 14
+        frame_len_sec = 0.08
+        step_duration = frame_hop_length * frame_len_sec
+        diar_preds = torch.ones(1, frame_hop_length, 1)
+        active_result = [(None, None, None, None)]
+        asr_forward_calls = []
+        seglst_offsets = []
+
+        def conformer_stream_step(**kwargs):
+            asr_forward_calls.append(kwargs)
+            return (
+                torch.zeros(1, 1),
+                None,
+                torch.zeros(1, 1, 1),
+                torch.zeros(1, 1, 1),
+                torch.zeros(1),
+                [object()],
+            )
+
+        instance_manager = SimpleNamespace(
+            diar_states=SimpleNamespace(streaming_state=object()),
+            reset=lambda **kwargs: None,
+            to=lambda device: None,
+            update_diar_state=lambda **kwargs: None,
+            get_active_speakers_info=lambda **kwargs: active_result[0],
+            active_cache_last_channel=torch.zeros(1, 1, 1),
+            active_cache_last_time=torch.zeros(1, 1, 1),
+            active_cache_last_channel_len=torch.zeros(1),
+            active_previous_hypotheses=[None],
+            active_asr_pred_out_stream=[None],
+            update_asr_state=lambda *args: None,
+            update_seglsts=lambda offset: seglst_offsets.append(offset),
+            batch_asr_states=[],
+        )
+        streamer = SimpleNamespace(
+            _offset_chunk_start_time=0.0,
+            _frame_hop_length=frame_hop_length,
+            _frame_len_sec=frame_len_sec,
+            _nframes_per_chunk=frame_hop_length,
+            _max_num_of_spks=1,
+            _single_speaker_mode=False,
+            _cache_gating=True,
+            _cache_gating_buffer_size=4,
+            _masked_asr=True,
+            _use_mask_preencode=False,
+            _binary_diar_preds=True,
+            n_active_speakers_per_stream=1,
+            instance_manager=instance_manager,
+            diar_model=SimpleNamespace(rttms_mask_mats=diar_preds),
+            asr_model=SimpleNamespace(conformer_stream_step=conformer_stream_step),
+            get_diar_pred_out_stream=lambda step_num, is_buffer_empty: (diar_preds, diar_preds),
+            _find_active_speakers=lambda preds, n_active_speakers_per_stream: [[0]],
+            mask_features=lambda chunk_audio, mask: chunk_audio,
+            cfg={"generate_realtime_scripts": False},
+            transcribed_speaker_texts=[],
+        )
+        step_kwargs = {
+            "chunk_audio": torch.ones(1, 80, frame_hop_length),
+            "chunk_lengths": torch.tensor([frame_hop_length]),
+            "is_buffer_empty": False,
+            "drop_extra_pre_encoded": 0,
+        }
+
+        SpeakerTaggedASR.perform_parallel_streaming_stt_spk(streamer, step_num=0, **step_kwargs)
+        assert streamer._offset_chunk_start_time == pytest.approx(step_duration)
+        assert not asr_forward_calls
+
+        SpeakerTaggedASR.perform_parallel_streaming_stt_spk(streamer, step_num=1, **step_kwargs)
+        assert streamer._offset_chunk_start_time == pytest.approx(2 * step_duration)
+        assert not asr_forward_calls
+
+        active_result[0] = (
+            step_kwargs["chunk_audio"],
+            step_kwargs["chunk_lengths"],
+            torch.ones(1, frame_hop_length),
+            torch.zeros(1, frame_hop_length, dtype=torch.bool),
+        )
+        SpeakerTaggedASR.perform_parallel_streaming_stt_spk(streamer, step_num=2, **step_kwargs)
+        assert seglst_offsets == [pytest.approx(2 * step_duration)]
+        assert streamer._offset_chunk_start_time == pytest.approx(3 * step_duration)
+        assert len(asr_forward_calls) == 1
+
+        SpeakerTaggedASR.perform_parallel_streaming_stt_spk(streamer, step_num=0, **step_kwargs)
+        assert seglst_offsets[-1] == pytest.approx(0.0)
+        assert streamer._offset_chunk_start_time == pytest.approx(step_duration)
+        assert len(asr_forward_calls) == 2
+
+
 class TestParallelWordAwareSegmentation:
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -723,6 +825,60 @@ class TestParallelWordAwareSegmentation:
         exported_text = " ".join(segment["words"] for segment in state.seglsts)
 
         assert exported_text == expected_text
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "updates,expected_segments",
+        [
+            pytest.param(
+                [
+                    ("hello", [0, 1, 2, 3, 4], 0.0),
+                    ("hello.", [0, 1, 2, 3, 4, 5], 10.0),
+                ],
+                [("hello.", 0.0, 0.4)],
+                id="punctuation-after-long-gap",
+            ),
+            pytest.param(
+                [
+                    ("Don", [0, 1, 2], 0.0),
+                    ("Don't start", list(range(11)), 10.0),
+                ],
+                [("Don't", 0.0, 0.24), ("start", 10.0, 10.64)],
+                id="partial-word-and-new-words-after-long-gap",
+            ),
+            pytest.param(
+                [
+                    ("Lind", [0, 1, 2, 3], 0.0),
+                    ("Linda", [0, 1, 2, 3, 4], 10.0),
+                ],
+                [("Linda", 0.0, 0.32)],
+                id="partial-word-only-after-long-gap",
+            ),
+            pytest.param(
+                [
+                    ("Lind", [0, 1, 2, 3], 0.0),
+                    ("Linda", [0, 1, 2, 3, 4], 0.32),
+                ],
+                [("Linda", 0.0, 0.4)],
+                id="adjacent-continuation",
+            ),
+        ],
+    )
+    def test_continuation_timestamps_respect_inactive_gaps(self, updates, expected_segments):
+        state = run_parallel_hypothesis_updates(updates, sent_break_sec=0.5)
+        segments = state.seglsts
+
+        assert len(segments) == len(expected_segments)
+        for segment, (expected_text, expected_start, expected_end) in zip(segments, expected_segments):
+            assert segment["words"] == expected_text
+            assert segment["start_time"] == pytest.approx(expected_start)
+            assert segment["end_time"] == pytest.approx(expected_end)
+
+        assert " ".join(segment["words"] for segment in segments) == updates[-1][0]
+        assert all(segment["words"].strip() for segment in segments)
+        assert all(segment["words"].strip() not in {".", ",", "?", "!"} for segment in segments)
+        assert all(segment["start_time"] <= segment["end_time"] for segment in segments)
+        assert [segment["start_time"] for segment in segments] == sorted(segment["start_time"] for segment in segments)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -1143,8 +1299,30 @@ class TestSpeakerTaggedASRInit:
         assert speaker_tagged_asr._nframes_per_chunk == expected_block_frame_length
 
     @pytest.mark.unit
-    def test_init_default_config_values(self, asr_model, diar_model, tmp_path):
-        """Test initialization with default config values using .get() from MultitalkerTranscriptionConfig"""
+    @pytest.mark.parametrize(
+        (
+            "max_num_of_spks,sent_break_sec,masked_asr,cache_gating,"
+            "cache_gating_buffer_size,mask_preencode,single_speaker_mode"
+        ),
+        [
+            (3, 30.0, True, False, 2, False, False),
+            (1, 0.5, False, True, 4, True, True),
+        ],
+    )
+    def test_init_config_values(
+        self,
+        asr_model,
+        diar_model,
+        tmp_path,
+        max_num_of_spks,
+        sent_break_sec,
+        masked_asr,
+        cache_gating,
+        cache_gating_buffer_size,
+        mask_preencode,
+        single_speaker_mode,
+    ):
+        """Test initialization with config values accessed through .get()."""
         audio_path = tmp_path / "test.wav"
         audio_path.touch()
 
@@ -1154,15 +1332,16 @@ class TestSpeakerTaggedASRInit:
             fix_prev_words_count=5,
             update_prev_words_sentence=10,
             ignored_initial_frame_steps=2,
-            max_num_of_spks=3,
+            max_num_of_spks=max_num_of_spks,
             att_context_size=[0, 40],
             binary_diar_preds=True,
             batch_size=1,
-            sent_break_sec=30.0,  # Explicit value
-            masked_asr=True,  # Explicit value
-            cache_gating=False,  # Explicit value
-            mask_preencode=False,  # Explicit value
-            single_speaker_mode=False,  # Explicit value
+            sent_break_sec=sent_break_sec,
+            masked_asr=masked_asr,
+            cache_gating=cache_gating,
+            cache_gating_buffer_size=cache_gating_buffer_size,
+            mask_preencode=mask_preencode,
+            single_speaker_mode=single_speaker_mode,
             generate_realtime_scripts=False,
         )
         # Convert to OmegaConf to support .get() method
@@ -1172,16 +1351,13 @@ class TestSpeakerTaggedASRInit:
 
         # Verify values from .get() calls are properly set
         # pylint: disable=protected-access
-        assert speaker_tagged_asr._max_num_of_spks == 3  # From cfg.get("max_num_of_spks", 4)
-        assert speaker_tagged_asr._sent_break_sec == 30.0  # From cfg
-        # cache_gating and cache_gating_buffer_size use defaults via cfg.get() since they're not in MultitalkerTranscriptionConfig
-        assert speaker_tagged_asr._cache_gating is False  # Default value from cfg.get("cache_gating", False)
-        assert (
-            speaker_tagged_asr._cache_gating_buffer_size == 2
-        )  # Default value from cfg.get("cache_gating_buffer_size", 2)
-        assert speaker_tagged_asr._masked_asr is True  # From cfg
-        assert speaker_tagged_asr._use_mask_preencode is False  # From cfg
-        assert speaker_tagged_asr._single_speaker_mode is False  # From cfg
+        assert speaker_tagged_asr._max_num_of_spks == max_num_of_spks
+        assert speaker_tagged_asr._sent_break_sec == sent_break_sec
+        assert speaker_tagged_asr._cache_gating is cache_gating
+        assert speaker_tagged_asr._cache_gating_buffer_size == cache_gating_buffer_size
+        assert speaker_tagged_asr._masked_asr is masked_asr
+        assert speaker_tagged_asr._use_mask_preencode is mask_preencode
+        assert speaker_tagged_asr._single_speaker_mode is single_speaker_mode
         # pylint: enable=protected-access
 
     @pytest.mark.unit

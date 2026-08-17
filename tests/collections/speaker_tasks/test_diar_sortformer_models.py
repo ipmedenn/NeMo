@@ -21,6 +21,7 @@ import onnx
 import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
+    DiarizationConfig,
     configure_output_subsampling_factor,
     get_tensor_path,
 )
@@ -257,6 +258,11 @@ class TestSortformerEncLabelModelOffline:
 
 
 class TestSortformerEncLabelModelStreaming:
+    @pytest.mark.unit
+    @pytest.mark.parametrize("field_name", ["spkcache_len", "chunk_left_context"])
+    def test_model_dependent_streaming_overrides_default_to_none(self, field_name):
+        assert getattr(DiarizationConfig(), field_name) is None
+
     @pytest.mark.unit
     def test_constructor(self, sortformer_model):
         sortformer_model.streaming_mode = True

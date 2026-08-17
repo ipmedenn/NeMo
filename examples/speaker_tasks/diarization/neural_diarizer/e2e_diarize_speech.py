@@ -121,11 +121,11 @@ class DiarizationConfig:
     compile_encoder: bool = False
     # Emulate production streams arriving independently; offline batches otherwise update in lockstep.
     async_desync_updates: bool = False
-    spkcache_len: int = 188
+    spkcache_len: Optional[int] = None
     spkcache_update_period: int = 144
     fifo_len: int = 188
     chunk_len: int = 6
-    chunk_left_context: int = 1
+    chunk_left_context: Optional[int] = None
     chunk_right_context: int = 7
 
     # If `cuda` is a negative number, inference will be on CPU only.
@@ -461,8 +461,10 @@ def main(cfg: DiarizationConfig) -> Union[DiarizationConfig]:
         diar_model.async_pad_to_max = cfg.async_pad_to_max
         diar_model.sortformer_modules.async_desync_updates = cfg.async_desync_updates
         diar_model.sortformer_modules.chunk_len = cfg.chunk_len
-        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
-        diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
+        if cfg.spkcache_len is not None:
+            diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
+        if cfg.chunk_left_context is not None:
+            diar_model.sortformer_modules.chunk_left_context = cfg.chunk_left_context
         diar_model.sortformer_modules.chunk_right_context = cfg.chunk_right_context
         diar_model.sortformer_modules.fifo_len = cfg.fifo_len
         diar_model.sortformer_modules.log = cfg.log
