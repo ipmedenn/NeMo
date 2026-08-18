@@ -20,10 +20,7 @@ import numpy as np
 import onnx
 import pytest
 import torch
-from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
-    DiarizationConfig,
-    get_tensor_path,
-)
+from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import DiarizationConfig, get_tensor_path
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
