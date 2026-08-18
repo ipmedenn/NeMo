@@ -32,6 +32,7 @@ from nemo.collections.asr.modules.sortformer_modules import StreamingSortformerS
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 from nemo.collections.asr.parts.utils.diarization_utils import get_color_palette, print_sentences, write_txt
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.collections.asr.parts.utils.sortformer_utils import configure_output_subsampling_factor
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map as get_audio_rttm_map
 from nemo.collections.asr.parts.utils.speaker_utils import get_uniqname_from_filepath
 from nemo.utils import logging
@@ -168,6 +169,107 @@ def get_aligned_rttm_mask(feat_level_target: torch.Tensor, num_frames: int, stri
         feat_level_target = feat_level_target[:required_input_frames]
 
     return feat_level_target.reshape(num_frames, stride, feat_level_target.shape[1]).mean(dim=1)
+
+
+def set_batch_rttm_masks(
+    diar_model: SortformerEncLabelModel,
+    rttms_mask_mats: torch.Tensor,
+    batch_start: int,
+    batch_size: int,
+    device: torch.device,
+) -> None:
+    """
+    Attach only the ground-truth diarization masks corresponding to the current audio batch.
+
+    The selected masks replace the model's current batch masks; they are not appended.
+
+    Args:
+        diar_model (SortformerEncLabelModel): Model whose ``rttms_mask_mats`` value is replaced for this batch.
+        rttms_mask_mats (torch.Tensor): Complete tensor of reference diarization masks.
+        batch_start (int): Starting sample index in ``rttms_mask_mats``.
+        batch_size (int): Number of masks required for the current audio batch.
+        device (torch.device): Destination device for the selected masks.
+
+    Raises:
+        ValueError: If the requested slice contains fewer than ``batch_size`` masks.
+    """
+    batch_rttm_masks = rttms_mask_mats[batch_start : batch_start + batch_size]
+    if batch_rttm_masks.shape[0] != batch_size:
+        raise ValueError(
+            f"Expected {batch_size} RTTM masks for batch starting at {batch_start}, "
+            f"but found {batch_rttm_masks.shape[0]}"
+        )
+    diar_model.rttms_mask_mats = batch_rttm_masks.to(device)
+
+
+def configure_diar_streaming(
+    diar_model: SortformerEncLabelModel,
+    cfg: Any,
+    output_subsampling_factor: int,
+    diar_chunk_len: Optional[int] = None,
+) -> int:
+    """
+    Apply and validate runtime Sortformer streaming settings.
+
+    Args:
+        diar_model (SortformerEncLabelModel): Diarization model receiving the runtime overrides.
+        cfg (Any): Inference configuration containing cache, context, and output settings.
+        output_subsampling_factor (int): ASR encoder subsampling factor required for speaker-target alignment.
+        diar_chunk_len (Optional[int]): Central diarization chunk length derived from the effective ASR geometry.
+
+    Returns:
+        effective_output_factor (int): Validated number of 10 ms feature frames represented by each output frame.
+
+    Raises:
+        TypeError: If ``diar_right_context`` is not an integer or is a boolean.
+        ValueError: If right context is negative, the diarization output resolution cannot match the ASR output
+            resolution, or the resulting streaming geometry fails model validation.
+    """
+    if not isinstance(cfg.diar_right_context, int) or isinstance(cfg.diar_right_context, bool):
+        raise TypeError("diar_right_context must be an integer.")
+    if cfg.diar_right_context < 0:
+        raise ValueError("diar_right_context must be non-negative.")
+
+    diar_model.streaming_mode = cfg.streaming_mode
+    if cfg.spkcache_len is not None:
+        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
+    diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
+    diar_model.sortformer_modules.fifo_len = cfg.fifo_len
+    diar_model.sortformer_modules.log = cfg.log
+    if diar_chunk_len is not None:
+        diar_model.sortformer_modules.chunk_len = diar_chunk_len
+    diar_model.sortformer_modules.chunk_right_context = cfg.diar_right_context
+
+    effective_output_factor = configure_output_subsampling_factor(diar_model, output_subsampling_factor)
+    if effective_output_factor != output_subsampling_factor:
+        raise ValueError(
+            "MT-Parakeet requires the diarization output subsampling factor "
+            f"({effective_output_factor}) to equal the ASR encoder subsampling factor "
+            f"({output_subsampling_factor})."
+        )
+    if diar_model.streaming_mode:
+        diar_model._check_streaming_parameters()
+    return effective_output_factor
+
+
+def validate_feature_frame_strides(asr_model: Any, diar_model: SortformerEncLabelModel) -> None:
+    """
+    Validate that ASR and diarization preprocessors use the same input-feature frame stride.
+
+    Args:
+        asr_model (Any): ASR model providing the target output-frame geometry.
+        diar_model (SortformerEncLabelModel): Diarization model producing MT-Parakeet speaker targets.
+
+    Raises:
+        ValueError: If the ASR and diarization frontend frame strides differ.
+    """
+    asr_feature_stride = float(asr_model.cfg.preprocessor.window_stride)
+    diar_feature_stride = float(diar_model._cfg.preprocessor.window_stride)
+    if not math.isclose(asr_feature_stride, diar_feature_stride):
+        raise ValueError(
+            "MT-Parakeet requires equal ASR and diarization feature-frame strides, "
+            f"but got {asr_feature_stride} and {diar_feature_stride} seconds."
+        )
 
 
 def get_multi_talker_samples_from_manifest(cfg, manifest_file: str, feat_per_sec: float, max_spks: int):
@@ -1050,7 +1152,12 @@ class SpeakerTaggedASR:
             length = (length - drop_extra_pre_encoded).clamp(min=0)
         return audio_signal, length
 
-    def _prepare_diar_chunk(self, chunk_audio, chunk_lengths, drop_extra_pre_encoded):
+    def _prepare_diar_chunk(
+        self,
+        chunk_audio: torch.Tensor,
+        chunk_lengths: torch.Tensor,
+        drop_extra_pre_encoded: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
         Adapt an ASR cache-aware chunk to the diarization model's pre-encoder geometry.
 
@@ -1091,10 +1198,10 @@ class SpeakerTaggedASR:
 
     def _forward_diarization_streaming_step(
         self,
-        diar_chunk_audio,
-        diar_chunk_lengths,
-        drop_extra_pre_encoded,
-    ):
+        diar_chunk_audio: torch.Tensor,
+        diar_chunk_lengths: torch.Tensor,
+        drop_extra_pre_encoded: int,
+    ) -> Tuple[StreamingSortformerState, torch.Tensor]:
         """
         Run one Sortformer step on the dedicated diarization feature view.
 
@@ -1187,7 +1294,9 @@ class SpeakerTaggedASR:
 
         return masked_chunk_audio
 
-    def get_diar_pred_out_stream(self, step_num, is_buffer_empty=False):
+    def get_diar_pred_out_stream(
+        self, step_num: int, is_buffer_empty: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Get the diar prediction output stream for the given step number.
 

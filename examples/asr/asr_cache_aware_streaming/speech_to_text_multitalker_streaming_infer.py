@@ -12,30 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-import os
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field, is_dataclass
-from pathlib import Path
 from typing import List, Optional, Union
 
 import pytorch_lightning as pl
 import torch
-from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
-    configure_output_subsampling_factor,
-    convert_pred_mat_to_segments,
-)
 from omegaconf import OmegaConf
 
 import nemo.collections.asr as nemo_asr
-from nemo.collections.asr.metrics.der import score_labels
 from nemo.collections.asr.models.sortformer_diar_models import SortformerEncLabelModel
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
+from nemo.collections.asr.parts.utils.diarization_utils import (
+    collect_diar_predictions,
+    write_and_score_diar_predictions,
+)
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     SpeakerTaggedASR,
     add_delay_for_real_time,
+    configure_diar_streaming,
     get_multi_talker_samples_from_manifest,
+    set_batch_rttm_masks,
+    validate_feature_frame_strides,
     write_seglst_file,
 )
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
@@ -106,7 +104,7 @@ class MultitalkerTranscriptionConfig:
     # Multitalker transcription configs
     verbose: bool = False
     word_window: int = 50
-    sent_break_sec: float = 0.25  # minimum time gap between sentences
+    sent_break_sec: float = 1.0  # minimum time gap between sentences
     fix_prev_words_count: int = 5
     update_prev_words_sentence: int = 5
     left_frame_shift: int = -1
@@ -120,216 +118,6 @@ class MultitalkerTranscriptionConfig:
     print_path: Optional[str] = None
     ignored_initial_frame_steps: int = 5
     finetune_realtime_ratio: float = 0.01
-
-
-def set_batch_rttm_masks(diar_model, rttms_mask_mats, batch_start: int, batch_size: int, device: torch.device):
-    """
-    Attach only the ground-truth diarization masks corresponding to the current audio batch.
-
-    The selected masks replace the model's current batch masks; they are not appended.
-
-    Args:
-        diar_model (SortformerEncLabelModel): Model whose ``rttms_mask_mats`` value is replaced for this batch.
-        rttms_mask_mats (torch.Tensor): Complete tensor of reference diarization masks.
-        batch_start (int): Starting sample index in ``rttms_mask_mats``.
-        batch_size (int): Number of masks required for the current audio batch.
-        device (torch.device): Destination device for the selected masks.
-
-    Raises:
-        ValueError: If the requested slice contains fewer than ``batch_size`` masks.
-    """
-    batch_rttm_masks = rttms_mask_mats[batch_start : batch_start + batch_size]
-    if batch_rttm_masks.shape[0] != batch_size:
-        raise ValueError(
-            f"Expected {batch_size} RTTM masks for batch starting at {batch_start}, "
-            f"but found {batch_rttm_masks.shape[0]}"
-        )
-    diar_model.rttms_mask_mats = batch_rttm_masks.to(device)
-
-
-def collect_diar_predictions(
-    diar_preds: torch.Tensor,
-    samples,
-    feature_lengths: torch.Tensor,
-    feature_frame_length_sec: float,
-    diar_frame_length_sec: float,
-):
-    """
-    Collect valid, unpadded diarization predictions and their metadata.
-
-    A missing manifest duration is derived as ``feature_lengths * feature_frame_length_sec``.
-
-    Args:
-        diar_preds (torch.Tensor): Diarization predictions whose leading dimension is the current batch size.
-        samples (list): Metadata dictionaries corresponding to the rows of ``diar_preds``.
-        feature_lengths (torch.Tensor): Per-recording valid lengths measured in input-feature frames.
-        feature_frame_length_sec (float): Duration in seconds of one input-feature frame.
-        diar_frame_length_sec (float): Duration in seconds represented by one diarization output frame.
-
-    Returns:
-        predictions_and_metadata (tuple): A two-item tuple containing a list of CPU prediction tensors trimmed to
-            each recording's valid duration and copied metadata dictionaries with resolved ``duration`` values and
-            a default ``offset`` of zero.
-
-    Raises:
-        ValueError: If the prediction, sample, and feature-length batch sizes disagree.
-    """
-    if diar_preds.shape[0] != len(samples) or len(samples) != len(feature_lengths):
-        raise ValueError(
-            f"Batch size mismatch: diar_preds={diar_preds.shape[0]}, samples={len(samples)}, "
-            f"feature_lengths={len(feature_lengths)}"
-        )
-
-    diar_preds = diar_preds.detach().cpu()
-    feature_lengths = feature_lengths.detach().cpu()
-    predictions, metadata = [], []
-
-    for batch_idx, sample in enumerate(samples):
-        duration = sample.get("duration")
-        if duration is None:
-            duration = feature_lengths[batch_idx].item() * feature_frame_length_sec
-        valid_frames = min(
-            diar_preds.shape[1],
-            math.ceil(duration / diar_frame_length_sec),
-        )
-        predictions.append(diar_preds[batch_idx : batch_idx + 1, :valid_frames])
-        sample_metadata = dict(sample)
-        sample_metadata["duration"] = duration
-        sample_metadata.setdefault("offset", 0.0)
-        metadata.append(sample_metadata)
-    return predictions, metadata
-
-
-def write_and_score_diar_predictions(predictions, samples, cfg, output_subsampling_factor):
-    """
-    Convert predictions with the standalone e2e path, write RTTMs, and score when references exist.
-
-    Each recording ID is resolved from a non-empty ``uniq_id`` or, when unavailable, from the audio filename stem.
-    RTTM files are written when an output directory is configured, and DER is calculated only when every reference
-    RTTM file exists.
-
-    Args:
-        predictions (list): One diarization prediction tensor per recording.
-        samples (list): Metadata dictionaries corresponding to ``predictions``.
-        cfg (MultitalkerTranscriptionConfig): Output-directory and DER-scoring configuration.
-        output_subsampling_factor (int): Number of 10 ms feature frames represented by one diarization output frame.
-
-    Raises:
-        ValueError: If prediction and metadata counts differ, recording IDs are duplicated, or the resolved
-            recording IDs are otherwise inconsistent with the predictions.
-    """
-    if len(predictions) != len(samples):
-        raise ValueError(
-            f"Expected one metadata entry per prediction, but found {len(samples)} samples "
-            f"for {len(predictions)} predictions."
-        )
-
-    audio_rttm_map_dict = OrderedDict()
-    for sample in samples:
-        uniq_id = sample.get("uniq_id")
-        recording_id = str(uniq_id).strip() if uniq_id is not None else ""
-        if not recording_id:
-            recording_id = Path(sample["audio_filepath"]).stem
-        if recording_id in audio_rttm_map_dict:
-            previous_path = audio_rttm_map_dict[recording_id]["audio_filepath"]
-            raise ValueError(
-                f"Duplicate recording ID '{recording_id}' resolved for conflicting audio paths "
-                f"'{previous_path}' and '{sample['audio_filepath']}'."
-            )
-        audio_rttm_map_dict[recording_id] = sample
-
-    if len(audio_rttm_map_dict) != len(predictions):
-        raise ValueError(f"Expected {len(predictions)} unique recording IDs, but resolved {len(audio_rttm_map_dict)}.")
-
-    if cfg.diar_output_rttm_dir is not None:
-        Path(cfg.diar_output_rttm_dir).mkdir(parents=True, exist_ok=True)
-    all_hyps, all_refs, all_uems = convert_pred_mat_to_segments(
-        audio_rttm_map_dict=audio_rttm_map_dict,
-        postprocessing_cfg=None,
-        batch_preds_list=predictions,
-        unit_10ms_frame_count=output_subsampling_factor,
-        bypass_postprocessing=True,
-        out_rttm_dir=cfg.diar_output_rttm_dir,
-    )
-
-    has_references = all(sample.get("rttm_filepath") and os.path.exists(sample["rttm_filepath"]) for sample in samples)
-    if has_references:
-        logging.info(f"Calculating DER on {len(samples)} recordings...")
-        score_labels(
-            AUDIO_RTTM_MAP=audio_rttm_map_dict,
-            all_reference=all_refs,
-            all_hypothesis=all_hyps,
-            all_uem=all_uems,
-            collar=cfg.diar_collar,
-            ignore_overlap=cfg.diar_ignore_overlap,
-        )
-    elif any(sample.get("rttm_filepath") for sample in samples):
-        logging.warning("Skipping DER because one or more reference RTTM files do not exist.")
-
-
-def configure_diar_streaming(diar_model, cfg, output_subsampling_factor: int, diar_chunk_len=None) -> int:
-    """
-    Apply and validate runtime Sortformer streaming settings.
-
-    Args:
-        diar_model (SortformerEncLabelModel): Diarization model receiving the runtime overrides.
-        cfg (MultitalkerTranscriptionConfig): Inference configuration containing cache, context, and output settings.
-        output_subsampling_factor (int): ASR encoder subsampling factor required for speaker-target alignment.
-        diar_chunk_len (Optional[int]): Central diarization chunk length derived from the effective ASR geometry.
-
-    Returns:
-        effective_output_factor (int): Validated number of 10 ms feature frames represented by each output frame.
-
-    Raises:
-        TypeError: If ``diar_right_context`` is not an integer or is a boolean.
-        ValueError: If right context is negative, the diarization output resolution cannot match the ASR output
-            resolution, or the resulting streaming geometry fails model validation.
-    """
-    if not isinstance(cfg.diar_right_context, int) or isinstance(cfg.diar_right_context, bool):
-        raise TypeError("diar_right_context must be an integer.")
-    if cfg.diar_right_context < 0:
-        raise ValueError("diar_right_context must be non-negative.")
-
-    diar_model.streaming_mode = cfg.streaming_mode
-    if cfg.spkcache_len is not None:
-        diar_model.sortformer_modules.spkcache_len = cfg.spkcache_len
-    diar_model.sortformer_modules.spkcache_update_period = cfg.spkcache_update_period
-    diar_model.sortformer_modules.fifo_len = cfg.fifo_len
-    diar_model.sortformer_modules.log = cfg.log
-    if diar_chunk_len is not None:
-        diar_model.sortformer_modules.chunk_len = diar_chunk_len
-    diar_model.sortformer_modules.chunk_right_context = cfg.diar_right_context
-
-    effective_output_factor = configure_output_subsampling_factor(diar_model, output_subsampling_factor)
-    if effective_output_factor != output_subsampling_factor:
-        raise ValueError(
-            "MT-Parakeet requires the diarization output subsampling factor "
-            f"({effective_output_factor}) to equal the ASR encoder subsampling factor "
-            f"({output_subsampling_factor})."
-        )
-    if diar_model.streaming_mode:
-        diar_model._check_streaming_parameters()
-    return effective_output_factor
-
-
-def validate_feature_frame_strides(asr_model, diar_model):
-    """
-    Validate that ASR and diarization preprocessors use the same input-feature frame stride.
-
-    Args:
-        asr_model (ASRModel): ASR model providing the target output-frame geometry.
-        diar_model (SortformerEncLabelModel): Diarization model producing MT-Parakeet speaker targets.
-
-    Raises:
-        ValueError: If the ASR and diarization frontend frame strides differ.
-    """
-    asr_feature_stride = float(asr_model.cfg.preprocessor.window_stride)
-    diar_feature_stride = float(diar_model._cfg.preprocessor.window_stride)
-    if not math.isclose(asr_feature_stride, diar_feature_stride):
-        raise ValueError(
-            "MT-Parakeet requires equal ASR and diarization feature-frame strides, "
-            f"but got {asr_feature_stride} and {diar_feature_stride} seconds."
-        )
 
 
 def launch_serial_streaming(
@@ -671,8 +459,10 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
         write_and_score_diar_predictions(
             predictions=diar_predictions,
             samples=diar_samples,
-            cfg=cfg,
             output_subsampling_factor=diar_output_subsampling_factor,
+            diar_output_rttm_dir=cfg.diar_output_rttm_dir,
+            diar_collar=cfg.diar_collar,
+            diar_ignore_overlap=cfg.diar_ignore_overlap,
         )
 
     if len(seglst_dict_list) == 0:

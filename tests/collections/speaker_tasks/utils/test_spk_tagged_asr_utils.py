@@ -22,19 +22,19 @@ import torch
 from examples.asr.asr_cache_aware_streaming import speech_to_text_multitalker_streaming_infer as streaming_infer
 from examples.asr.asr_cache_aware_streaming.speech_to_text_multitalker_streaming_infer import (
     MultitalkerTranscriptionConfig,
-    collect_diar_predictions,
-    configure_diar_streaming,
-    set_batch_rttm_masks,
-    validate_feature_frame_strides,
-    write_and_score_diar_predictions,
 )
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.models.configs.asr_models_config import CacheAwareStreamingConfig
+from nemo.collections.asr.parts.utils.diarization_utils import (
+    collect_diar_predictions,
+    write_and_score_diar_predictions,
+)
 from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     MultiTalkerInstanceManager,
     SpeakerTaggedASR,
     append_word_and_ts_seq,
+    configure_diar_streaming,
     fix_frame_time_step,
     get_multi_talker_samples_from_manifest,
     get_multitoken_words,
@@ -42,6 +42,8 @@ from nemo.collections.asr.parts.utils.multispk_transcribe_utils import (
     get_simulated_softmax,
     get_word_dict_content_offline,
     get_word_dict_content_online,
+    set_batch_rttm_masks,
+    validate_feature_frame_strides,
     write_seglst,
 )
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -1058,16 +1060,13 @@ class TestWriteDiarPredictionsToRttm:
             feature_frame_length_sec=0.01,
             diar_frame_length_sec=0.08,
         )
-        cfg = SimpleNamespace(
-            diar_output_rttm_dir=str(output_dir),
-            diar_collar=0.0,
-            diar_ignore_overlap=False,
-        )
         write_and_score_diar_predictions(
             predictions=predictions,
             samples=metadata,
-            cfg=cfg,
             output_subsampling_factor=8,
+            diar_output_rttm_dir=str(output_dir),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
         )
 
         assert (output_dir / "session.rttm").read_text(encoding="utf-8").splitlines() == list(expected_lines)
@@ -1105,17 +1104,14 @@ class TestWriteDiarPredictionsToRttm:
     def test_distinct_recording_ids_write_distinct_rttms(self, tmp_path, samples, expected_recording_ids):
         output_dir = tmp_path / "rttms"
         predictions = [torch.full((1, 2, 1), 0.9) for _ in samples]
-        cfg = SimpleNamespace(
-            diar_output_rttm_dir=str(output_dir),
-            diar_collar=0.0,
-            diar_ignore_overlap=False,
-        )
 
         write_and_score_diar_predictions(
             predictions=predictions,
             samples=[dict(sample) for sample in samples],
-            cfg=cfg,
             output_subsampling_factor=8,
+            diar_output_rttm_dir=str(output_dir),
+            diar_collar=0.0,
+            diar_ignore_overlap=False,
         )
 
         assert sorted(path.stem for path in output_dir.glob("*.rttm")) == sorted(expected_recording_ids)
@@ -1141,18 +1137,14 @@ class TestWriteDiarPredictionsToRttm:
         ],
     )
     def test_duplicate_recording_ids_raise_value_error(self, tmp_path, samples, duplicate_id):
-        cfg = SimpleNamespace(
-            diar_output_rttm_dir=str(tmp_path / "rttms"),
-            diar_collar=0.0,
-            diar_ignore_overlap=False,
-        )
-
         with pytest.raises(ValueError, match=f"Duplicate recording ID '{duplicate_id}'") as error:
             write_and_score_diar_predictions(
                 predictions=[torch.zeros(1, 1, 1) for _ in samples],
                 samples=[dict(sample) for sample in samples],
-                cfg=cfg,
                 output_subsampling_factor=8,
+                diar_output_rttm_dir=str(tmp_path / "rttms"),
+                diar_collar=0.0,
+                diar_ignore_overlap=False,
             )
 
         for sample in samples:

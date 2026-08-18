@@ -18,7 +18,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Iterator, NamedTuple, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -1694,7 +1694,9 @@ class CacheAwareStreamingAudioBuffer:
             self.step += 1
             yield audio_chunk, chunk_lengths
 
-    def iter_with_right_context(self, right_context_size: int):
+    def iter_with_right_context(
+        self, right_context_size: int
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Iterate over ASR chunks and separate diarization chunks with future context.
 
@@ -1725,12 +1727,12 @@ class CacheAwareStreamingAudioBuffer:
 
     def _prepare_chunk_view(
         self,
-        main_chunk,
-        cache_pre_encode,
-        zeros_pads,
-        expected_main_size=None,
-        normalization_lengths=None,
-    ):
+        main_chunk: torch.Tensor,
+        cache_pre_encode: torch.Tensor,
+        zeros_pads: Optional[torch.Tensor],
+        expected_main_size: Optional[int] = None,
+        normalization_lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Add pre-encoder cache, normalization, and optional fixed-width right padding to a feature view.
 
@@ -1776,7 +1778,9 @@ class CacheAwareStreamingAudioBuffer:
         chunk_lengths = torch.clamp(max_chunk_lengths, min=0, max=audio_chunk.size(-1))
         return audio_chunk, chunk_lengths
 
-    def _iter_with_right_context(self, right_context_size: int):
+    def _iter_with_right_context(
+        self, right_context_size: int
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Build dedicated ASR and diarization views while advancing by the ASR shift.
 

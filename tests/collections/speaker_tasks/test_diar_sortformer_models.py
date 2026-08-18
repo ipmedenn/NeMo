@@ -22,7 +22,6 @@ import pytest
 import torch
 from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
     DiarizationConfig,
-    configure_output_subsampling_factor,
     get_tensor_path,
 )
 from omegaconf import DictConfig
@@ -30,7 +29,7 @@ from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
-from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler
+from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler, configure_output_subsampling_factor
 
 
 class RecordingSpecAugment(torch.nn.Module):
