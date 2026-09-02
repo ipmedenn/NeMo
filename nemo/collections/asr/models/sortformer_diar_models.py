@@ -298,6 +298,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             soft_targets=config.soft_targets if 'soft_targets' in config else False,
             subsampling_factor=self.output_subsampling_factor,
             device=self.device,
+            subsegment_mode=config.get('subsegment_mode', False),
+            subsegment_single_chunk_min_len_sec=config.get('subsegment_single_chunk_min_len_sec', 15.0),
+            subsegment_two_chunk_min_len_sec=config.get('subsegment_two_chunk_min_len_sec', 10.0),
+            subsegment_two_chunks_rate=config.get('subsegment_two_chunks_rate', 0.0),
+            subsegment_nspk_bias=config.get('subsegment_nspk_bias', 1.0),
+            subsegment_start_guard_sec=config.get('subsegment_start_guard_sec', 0.25),
+            subsegment_min_first_spk_sec=config.get('subsegment_min_first_spk_sec', 0.50),
+            subsegment_splice_silence_sec=config.get('subsegment_splice_silence_sec', 0.10),
+            validate_manifest_paths=config.get('validate_manifest_paths', True),
         )
 
         self.data_collection = dataset.collection
@@ -522,6 +531,15 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
             'pin_memory': True,
             'use_lhotse': config.get('use_lhotse', False),
+            'subsegment_mode': config.get('subsegment_mode', False),
+            'subsegment_single_chunk_min_len_sec': config.get('subsegment_single_chunk_min_len_sec', 15.0),
+            'subsegment_two_chunk_min_len_sec': config.get('subsegment_two_chunk_min_len_sec', 10.0),
+            'subsegment_two_chunks_rate': config.get('subsegment_two_chunks_rate', 0.0),
+            'subsegment_nspk_bias': config.get('subsegment_nspk_bias', 1.0),
+            'subsegment_start_guard_sec': config.get('subsegment_start_guard_sec', 0.25),
+            'subsegment_min_first_spk_sec': config.get('subsegment_min_first_spk_sec', 0.50),
+            'subsegment_splice_silence_sec': config.get('subsegment_splice_silence_sec', 0.10),
+            'validate_manifest_paths': config.get('validate_manifest_paths', True),
         }
         temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
         return temporary_datalayer
@@ -1171,7 +1189,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             (dict): A dictionary containing the 'loss' key with the calculated loss value.
         """
-        audio_signal, audio_signal_length, targets, target_lens = batch
+        audio_signal, audio_signal_length, targets, target_lens, *_ = batch
         preds = self.forward(audio_signal=audio_signal, audio_signal_length=audio_signal_length)
         train_metrics = self._get_aux_train_evaluations(preds, targets, target_lens)
         self._reset_train_metrics()
@@ -1246,7 +1264,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Returns:
             dict: A dictionary containing various validation metrics for this batch.
         """
-        audio_signal, audio_signal_length, targets, target_lens = batch
+        audio_signal, audio_signal_length, targets, target_lens, *_ = batch
         preds = self.forward(
             audio_signal=audio_signal,
             audio_signal_length=audio_signal_length,
@@ -1365,7 +1383,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(self._test_dl)):
-                audio_signal, audio_signal_length, targets, target_lens = batch
+                audio_signal, audio_signal_length, targets, target_lens, *_ = batch
                 audio_signal = audio_signal.to(self.device)
                 audio_signal_length = audio_signal_length.to(self.device)
                 targets = targets.to(self.device)

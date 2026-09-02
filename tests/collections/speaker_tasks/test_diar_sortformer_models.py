@@ -910,6 +910,66 @@ class TestSortformerEncLabelModelHighResolution:
         assert dataset_constructor.call_args.kwargs["subsampling_factor"] == output_subsampling_factor
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "subsegment_options",
+        [
+            {
+                "subsegment_mode": True,
+                "subsegment_single_chunk_min_len_sec": 30.0,
+                "subsegment_two_chunk_min_len_sec": 12.0,
+                "subsegment_two_chunks_rate": 0.5,
+                "subsegment_nspk_bias": 2.0,
+                "subsegment_start_guard_sec": 0.3,
+                "subsegment_min_first_spk_sec": 0.6,
+                "subsegment_splice_silence_sec": 0.2,
+                "validate_manifest_paths": False,
+            },
+            {
+                "subsegment_mode": False,
+                "subsegment_single_chunk_min_len_sec": 20.0,
+                "subsegment_two_chunk_min_len_sec": 8.0,
+                "subsegment_two_chunks_rate": 0.0,
+                "subsegment_nspk_bias": 1.0,
+                "subsegment_start_guard_sec": 0.0,
+                "subsegment_min_first_spk_sec": 0.4,
+                "subsegment_splice_silence_sec": 0.1,
+                "validate_manifest_paths": True,
+            },
+        ],
+        ids=["enabled-custom-options", "disabled-custom-options"],
+    )
+    def test_legacy_dataloader_forwards_subsegment_options(self, subsegment_options):
+        model = _create_sortformer_model()
+        dataset = SimpleNamespace(collection=[], eesd_train_collate_fn=lambda batch: batch)
+        config = DictConfig(
+            {
+                "manifest_filepath": "unused.json",
+                "sample_rate": 16000,
+                "soft_label_thres": 0.5,
+                "session_len_sec": 90,
+                "num_spks": 4,
+                "soft_targets": False,
+                "batch_size": 1,
+                "num_workers": 0,
+                "use_lhotse": False,
+                **subsegment_options,
+            }
+        )
+
+        with patch(
+            "nemo.collections.asr.models.sortformer_diar_models.AudioToSpeechE2ESpkDiarDataset",
+            return_value=dataset,
+        ) as dataset_constructor:
+            model._SortformerEncLabelModel__setup_dataloader_from_config(config)
+
+        dataset_kwargs = dataset_constructor.call_args.kwargs
+        for option, expected_value in subsegment_options.items():
+            if isinstance(expected_value, bool):
+                assert dataset_kwargs[option] is expected_value
+            else:
+                assert dataset_kwargs[option] == expected_value
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("output_subsampling_factor", [1, 3, 16])
     def test_lhotse_dataloader_uses_high_resolution_targets(self, output_subsampling_factor):
         model = _create_sortformer_model(
