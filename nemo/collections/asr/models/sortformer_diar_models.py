@@ -246,6 +246,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         sortformer_modules_cfg.subsampling_factor = self.encoder.subsampling_factor
         sortformer_modules_cfg.upsample_factor = self.upsample_factor
         self.sortformer_modules = SortformerEncLabelModel.from_config_dict(sortformer_modules_cfg).to(self.device)
+        if self.sortformer_modules.causal_attn_rate > 0 and not hasattr(self.encoder, "att_context_size"):
+            raise ValueError("causal_attn_rate is only supported by encoders with configurable att_context_size.")
         transformer_encoder_cfg = self._cfg.get('transformer_encoder')
         self.transformer_encoder = (
             SortformerEncLabelModel.from_config_dict(transformer_encoder_cfg).to(self.device)
@@ -372,7 +374,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
         dataset = AudioToSpeechE2ESpkDiarDataset(
             manifest_filepath=config.manifest_filepath,
-            soft_label_thres=config.soft_label_thres,
+            soft_label_thres=config.get('soft_label_thres', 0.5),
             session_len_sec=config.session_len_sec,
             num_spks=config.num_spks,
             featurizer=featurizer,
@@ -629,7 +631,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'num_spks': config.get('num_spks', self._cfg.max_num_of_spks),
             'batch_size': batch_size,
             'shuffle': False,
-            'soft_label_thres': 0.5,
+            'soft_label_thres': config.get('soft_label_thres', 0.5),
             'session_len_sec': config['session_len_sec'],
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
             'pin_memory': True,

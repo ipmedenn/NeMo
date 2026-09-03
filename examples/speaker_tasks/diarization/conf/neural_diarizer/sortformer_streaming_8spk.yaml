@@ -1,0 +1,196 @@
+# Streaming Sortformer diarizer with a FlexAttention Transformer backbone.
+# This is a second stage training configuration for the Nemotron-3-Diarization model.
+# Example manifest line:
+# {"audio_filepath": "/path/to/audio.wav", "offset": 0.0, "duration": 1000.0, "num_speakers": 8, "rttm_filepath": "/path/to/audio.rttm"}
+name: "SortformerDiarizer_streaming_8spk"
+num_workers: 18
+batch_size: 42
+seed: 42
+
+init_from_nemo_model: null
+# init_from_nemo_model:
+#   stage1:
+#     path: /path/to/SortformerDiarizer_offline_8spk.nemo  # Set to the path to the first stage offline model
+#     include: ["encoder", "sortformer_modules"]
+
+model:
+  sample_rate: 16000
+  pil_weight: 0.75
+  ats_weight: 0.25
+  ats_tolerance: 0
+  max_num_of_spks: 8
+  high_resolution: true
+  output_subsampling_factor: 1
+  streaming_mode: true
+
+  model_defaults:
+    fc_d_model: 512
+    tf_d_model: 192
+
+  train_ds:
+    manifest_filepath: ???
+    validate_manifest_paths: false
+    sample_rate: ${model.sample_rate}
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: 105
+    soft_targets: false
+    batch_size: ${batch_size}
+    shuffle: true
+    num_workers: ${num_workers}
+    pin_memory: true
+    use_lhotse: false
+    # Long-session subsegment sampling
+    subsegment_mode: true
+    subsegment_single_chunk_min_len_sec: 45
+    subsegment_two_chunks_rate: 0.5
+    subsegment_two_chunk_min_len_sec: 22
+    subsegment_nspk_bias: 1.5
+    subsegment_start_guard_sec: 0.25
+    subsegment_min_first_spk_sec: 0.50
+    subsegment_splice_silence_sec: 0.10
+
+  validation_ds:
+    manifest_filepath: ???
+    sample_rate: ${model.sample_rate}
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: -1
+    soft_targets: false
+    batch_size: 32
+    shuffle: false
+    num_workers: ${num_workers}
+    drop_last: false
+    pin_memory: true
+    use_lhotse: false
+
+  test_ds:
+    manifest_filepath: null
+    sample_rate: ${model.sample_rate}
+    num_spks: ${model.max_num_of_spks}
+    session_len_sec: -1
+    soft_targets: false
+    batch_size: 32
+    shuffle: false
+    num_workers: ${num_workers}
+    drop_last: false
+    pin_memory: true
+    use_lhotse: false
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    normalize: NA
+    window_size: 0.025
+    sample_rate: ${model.sample_rate}
+    window_stride: 0.01
+    window: hann
+    features: 128
+    n_fft: 512
+    frame_splicing: 1
+    dither: 0.00001
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 2
+    time_masks: 0
+    freq_width: 24
+    time_width: 0.02
+    mask_value: -15
+
+  sortformer_modules:
+    _target_: nemo.collections.asr.modules.sortformer_modules.SortformerModules
+    num_spks: ${model.max_num_of_spks}
+    dropout_rate: 0.5
+    fc_d_model: ${model.model_defaults.fc_d_model}
+    tf_d_model: ${model.model_defaults.tf_d_model}
+    spkcache_len: 264
+    fifo_len: 0
+    chunk_len: 264
+    spkcache_update_period: 264
+    chunk_left_context: 0
+    chunk_right_context: 0
+    spkcache_sil_frames_per_spk: 1
+    scores_add_rnd: 0
+    pred_score_threshold: 0.25
+    max_index: 99999
+    scores_boost_latest: 0.05
+    sil_threshold: 0.2
+    strong_boost_rate: 0.75
+    weak_boost_rate: 1.5
+    min_pos_scores_rate: 0.5
+    causal_attn_rate: 0
+    use_learnable_sil_emb: true
+
+  encoder:
+    _target_: nemo.collections.asr.modules.TransformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 31
+    d_model: ${model.model_defaults.fc_d_model}
+    n_heads: 8
+    subsampling: feature_stacking
+    subsampling_factor: 8
+    ff_expansion: 4.0
+    self_attention_model: rope
+    pos_emb_max_len: 5000
+    xscaling: false
+    qkv_bias: false
+    qk_norm: false
+    pre_block_norm: true
+    attn_mode: full
+    drop_rate: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    sync_max_audio_length: true
+
+  loss:
+    _target_: nemo.collections.asr.losses.bce_loss.BCELoss
+    weight: null
+    reduction: mean
+
+  lr: 0.0001
+  optim:
+    name: adamw
+    lr: ${model.lr}
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: InverseSquareRootAnnealing
+      warmup_steps: 2000
+      warmup_ratio: null
+      min_lr: 1e-06
+
+trainer:
+  devices: 1
+  accelerator: gpu
+  precision: bf16-mixed
+  max_epochs: 1000
+  max_steps: 20000
+  num_nodes: 1
+  strategy: ddp
+  accumulate_grad_batches: 1
+  deterministic: true
+  enable_checkpointing: false
+  logger: false
+  log_every_n_steps: 1
+  gradient_clip_val: 1.0
+  limit_train_batches: 500
+  val_check_interval: 500
+
+exp_manager:
+  use_datetime_version: false
+  exp_dir: null
+  name: ${name}
+  resume_if_exists: true
+  resume_from_checkpoint: null
+  resume_ignore_no_checkpoint: true
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  create_wandb_logger: false
+  checkpoint_callback_params:
+    monitor: val_f1_acc
+    mode: max
+    save_top_k: 10
+    every_n_epochs: 1
+  wandb_logger_kwargs:
+    resume: true
+    name: null
+    project: null

@@ -47,6 +47,7 @@ def _create_sortformer_model(
     output_subsampling_factor=None,
     include_transformer_encoder=True,
     frontend_encoder="conformer",
+    causal_attn_rate=0.0,
 ):
     if output_subsampling_factor is None:
         output_subsampling_factor = 1 if high_resolution else 8
@@ -84,6 +85,7 @@ def _create_sortformer_model(
         'dropout_rate': 0.5,
         'fc_d_model': model_defaults['fc_d_model'],
         'tf_d_model': model_defaults['tf_d_model'],
+        'causal_attn_rate': causal_attn_rate,
     }
 
     if frontend_encoder == "transformer":
@@ -209,7 +211,6 @@ class TestSortformerEncLabelModelOffline:
         )
         model.streaming_mode = streaming_mode
         if streaming_mode:
-            model.sortformer_modules.causal_attn_rate = 1.0
             model.train()
         else:
             model.eval()
@@ -221,6 +222,15 @@ class TestSortformerEncLabelModelOffline:
 
         assert model.transformer_encoder is None
         assert preds.shape[0] == audio.shape[0]
+
+    @pytest.mark.unit
+    def test_transformer_encoder_rejects_causal_attention_rate(self) -> None:
+        """Reject unsupported dynamic attention-context changes for the Transformer backbone."""
+        with pytest.raises(
+            ValueError,
+            match="causal_attn_rate is only supported by encoders with configurable att_context_size",
+        ):
+            _create_sortformer_model(frontend_encoder="transformer", causal_attn_rate=0.5)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -894,7 +904,6 @@ class TestSortformerEncLabelModelHighResolution:
             {
                 "manifest_filepath": "unused.json",
                 "sample_rate": 16000,
-                "soft_label_thres": 0.5,
                 "session_len_sec": 1,
                 "num_spks": 4,
                 "soft_targets": False,
@@ -911,6 +920,7 @@ class TestSortformerEncLabelModelHighResolution:
             model._SortformerEncLabelModel__setup_dataloader_from_config(config)
 
         assert dataset_constructor.call_args.kwargs["subsampling_factor"] == output_subsampling_factor
+        assert dataset_constructor.call_args.kwargs["soft_label_thres"] == 0.5
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
