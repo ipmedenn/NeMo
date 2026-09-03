@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import math
+from collections import Counter
 from types import SimpleNamespace
+from typing import List, Union
 from unittest.mock import patch
 
 import numpy as np
@@ -25,6 +27,7 @@ from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
+from nemo.collections.asr.models.sortformer_diar_models import _OversamplingDistributedSampler
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
 from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler, configure_output_subsampling_factor
 
@@ -908,6 +911,200 @@ class TestSortformerEncLabelModelHighResolution:
             model._SortformerEncLabelModel__setup_dataloader_from_config(config)
 
         assert dataset_constructor.call_args.kwargs["subsampling_factor"] == output_subsampling_factor
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "is_training, limit_train_batches, expect_oversampling",
+        [(True, 3, True), (True, 1.0, False), (False, 3, False)],
+        ids=["fixed-training-limit", "fractional-training-limit", "validation-loader"],
+    )
+    def test_legacy_dataloader_derives_training_epoch_size(
+        self,
+        is_training: bool,
+        limit_train_batches: Union[int, float],
+        expect_oversampling: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify fixed oversampling is limited to integer-sized training epochs."""
+        monkeypatch.setenv("PL_GLOBAL_SEED", "1234")
+        model = _create_sortformer_model()
+        model._trainer = SimpleNamespace(global_rank=1, limit_train_batches=limit_train_batches)
+        model.world_size = 2
+        dataset = torch.utils.data.TensorDataset(torch.arange(5))
+        dataset.collection = list(range(5))
+        dataset.eesd_train_collate_fn = lambda batch: batch
+        config = DictConfig(
+            {
+                "manifest_filepath": "unused.json",
+                "sample_rate": 16000,
+                "soft_label_thres": 0.5,
+                "session_len_sec": 1,
+                "num_spks": 4,
+                "soft_targets": False,
+                "batch_size": 2,
+                "num_workers": 0,
+                "use_lhotse": False,
+                "shuffle": True,
+            }
+        )
+
+        with patch(
+            "nemo.collections.asr.models.sortformer_diar_models.AudioToSpeechE2ESpkDiarDataset",
+            return_value=dataset,
+        ):
+            if is_training:
+                model.setup_training_data(config)
+                dataloader = model._train_dl
+            else:
+                dataloader = model._SortformerEncLabelModel__setup_dataloader_from_config(config)
+
+        assert isinstance(dataloader.sampler, _OversamplingDistributedSampler) is expect_oversampling
+        if expect_oversampling:
+            assert dataloader.sampler.shuffle is True
+            assert dataloader.sampler.seed == 1234
+            assert dataloader.sampler._batch_size == config.batch_size
+            assert dataloader.sampler.num_samples == config.batch_size * limit_train_batches
+            assert dataloader.sampler.total_size == model.world_size * dataloader.sampler.num_samples
+            assert len(dataloader.sampler) == config.batch_size * limit_train_batches
+            assert len(dataloader) == limit_train_batches
+            assert len(list(dataloader.sampler)) == config.batch_size * limit_train_batches
+        else:
+            expected_sampler_type = (
+                torch.utils.data.RandomSampler if is_training else torch.utils.data.SequentialSampler
+            )
+            assert isinstance(dataloader.sampler, expected_sampler_type)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("shuffle", [False, True])
+    def test_oversampling_sampler_balances_non_divisible_dataset(self, shuffle: bool) -> None:
+        """Verify global cycles do not amplify distributed padding duplicates."""
+        dataset = torch.utils.data.TensorDataset(torch.arange(5))
+        rank_outputs: List[List[int]] = []
+        for rank in range(2):
+            sampler = _OversamplingDistributedSampler(
+                dataset,
+                num_samples_per_rank=20,
+                batch_size=2,
+                num_replicas=2,
+                rank=rank,
+                shuffle=shuffle,
+                seed=17,
+            )
+            sampler.set_epoch(3)
+            rank_outputs.append(list(sampler))
+
+        assert [len(indices) for indices in rank_outputs] == [20, 20]
+        assert Counter(rank_outputs[0] + rank_outputs[1]) == Counter({index: 8 for index in range(5)})
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("dataset_size", "target", "expected"),
+        [
+            (3, 8, [0, 1, 2, 0, 1, 2, 0, 1]),
+            (4, 6, [0, 1, 2, 3, 0, 1]),
+        ],
+    )
+    def test_oversampling_sampler_sequential_cycles(self, dataset_size: int, target: int, expected: List[int]) -> None:
+        """Verify disabling shuffle preserves sequential order across cycles."""
+        sampler = _OversamplingDistributedSampler(
+            torch.utils.data.TensorDataset(torch.arange(dataset_size)),
+            num_samples_per_rank=target,
+            batch_size=2,
+            num_replicas=1,
+            rank=0,
+            shuffle=False,
+        )
+
+        assert list(sampler) == expected
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("seed", "epoch", "expect_same"),
+        [(17, 3, True), (18, 3, False), (17, 4, False)],
+        ids=["same-seed-and-epoch", "different-seed", "different-epoch"],
+    )
+    def test_oversampling_sampler_shuffle_seed_and_epoch(self, seed: int, epoch: int, expect_same: bool) -> None:
+        """Verify shuffled sequences reproduce only with the same seed and epoch."""
+        dataset = torch.utils.data.TensorDataset(torch.arange(11))
+        baseline = _OversamplingDistributedSampler(
+            dataset,
+            num_samples_per_rank=33,
+            batch_size=3,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=17,
+        )
+        baseline.set_epoch(3)
+        candidate = _OversamplingDistributedSampler(
+            dataset,
+            num_samples_per_rank=33,
+            batch_size=3,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=seed,
+        )
+        candidate.set_epoch(epoch)
+
+        assert (list(candidate) == list(baseline)) is expect_same
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(("completed_batches", "batch_size"), [(2, 2), (1, 3)])
+    def test_oversampling_sampler_rotates_past_completed_batches(
+        self, completed_batches: int, batch_size: int
+    ) -> None:
+        """Verify a resumed epoch starts at its first unconsumed local index."""
+
+        def trainer_state(completed: int) -> SimpleNamespace:
+            """Build the minimal Lightning progress state consumed by the sampler."""
+            current = SimpleNamespace(completed=completed)
+            batch_progress = SimpleNamespace(current=current)
+            epoch_loop = SimpleNamespace(batch_progress=batch_progress)
+            return SimpleNamespace(current_epoch=5, fit_loop=SimpleNamespace(epoch_loop=epoch_loop))
+
+        dataset = torch.utils.data.TensorDataset(torch.arange(7))
+        full_sampler = _OversamplingDistributedSampler(
+            dataset,
+            num_samples_per_rank=18,
+            batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=23,
+            trainer=trainer_state(0),
+        )
+        resumed_sampler = _OversamplingDistributedSampler(
+            dataset,
+            num_samples_per_rank=18,
+            batch_size=batch_size,
+            num_replicas=1,
+            rank=0,
+            shuffle=True,
+            seed=23,
+            trainer=trainer_state(completed_batches),
+        )
+
+        full = list(full_sampler)
+        resumed = list(resumed_sampler)
+        offset = completed_batches * batch_size
+        assert resumed[: 18 - offset] == full[offset:]
+        assert resumed == full[offset:] + full[:offset]
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(("num_replicas", "rank"), [(1, 0), (2, 1)])
+    def test_oversampling_sampler_rejects_empty_dataset(self, num_replicas: int, rank: int) -> None:
+        """Verify empty datasets fail clearly for single-rank and distributed sampling."""
+        sampler = _OversamplingDistributedSampler(
+            torch.utils.data.TensorDataset(torch.empty(0)),
+            num_samples_per_rank=4,
+            batch_size=2,
+            num_replicas=num_replicas,
+            rank=rank,
+        )
+
+        with pytest.raises(ValueError, match="training dataset is empty"):
+            list(sampler)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(

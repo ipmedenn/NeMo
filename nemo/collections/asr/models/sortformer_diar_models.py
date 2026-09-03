@@ -17,7 +17,7 @@ import math
 import os
 import random
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -48,6 +48,80 @@ from nemo.core.neural_types.elements import ProbsType
 from nemo.utils import logging
 
 __all__ = ['SortformerEncLabelModel']
+
+
+class _OversamplingDistributedSampler(torch.utils.data.DistributedSampler):
+    """Distributed sampler that cycles through the dataset to produce a fixed number of samples per epoch."""
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        *,
+        num_samples_per_rank: int,
+        batch_size: int,
+        trainer: Optional[Trainer] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Initialize the sampler.
+
+        Args:
+            dataset: Dataset whose indices are distributed across ranks.
+            num_samples_per_rank: Desired number of samples yielded by each rank.
+            batch_size: Number of samples in each per-rank dataloader batch.
+            trainer: Optional trainer used to align sampling when training resumes mid-epoch.
+            **kwargs: Additional arguments forwarded to ``DistributedSampler``.
+        """
+        super().__init__(dataset, **kwargs)
+        self.num_samples = num_samples_per_rank
+        self.total_size = self.num_samples * self.num_replicas
+        self._batch_size = batch_size
+        self._trainer = trainer
+
+    def _completed_batches_before_resume(self) -> int:
+        """Return the number of fully completed batches restored by the trainer."""
+        if self._trainer is None:
+            return 0
+        try:
+            completed = int(self._trainer.fit_loop.epoch_loop.batch_progress.current.completed)
+        except (AttributeError, TypeError, ValueError):
+            return 0
+        return max(completed, 0)
+
+    def __iter__(self) -> Iterator[int]:
+        """Yield this rank's padding-free indices, rotated past batches consumed before a resume."""
+        if self._trainer is not None:
+            current_epoch = getattr(self._trainer, "current_epoch", None)
+            if current_epoch is not None:
+                self.epoch = current_epoch
+
+        dataset_size = len(self.dataset)
+        if dataset_size == 0:
+            raise ValueError(
+                "OversamplingDistributedSampler received no indices because the training dataset is empty."
+            )
+
+        result = []
+        global_position = 0
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        while len(result) < self.num_samples:
+            if self.shuffle:
+                cycle_indices = torch.randperm(dataset_size, generator=generator)
+            else:
+                cycle_indices = torch.arange(dataset_size)
+
+            first_local_position = (self.rank - global_position) % self.num_replicas
+            result.extend(cycle_indices[first_local_position :: self.num_replicas].tolist())
+            global_position = (global_position + dataset_size) % self.num_replicas
+
+        result = result[: self.num_samples]
+        offset = (self._completed_batches_before_resume() * self._batch_size) % self.num_samples
+        return iter(result[offset:] + result[:offset])
+
+    def __len__(self) -> int:
+        """Return the fixed number of samples yielded on each rank."""
+        return self.num_samples
 
 
 class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixin):
@@ -145,7 +219,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         Initialize an Sortformer Diarizer model and a pretrained NEST encoder.
         In this init function, training and validation datasets are prepared.
         """
-        random.seed(42)
         self._trainer = trainer if trainer else None
         self._cfg = cfg
         self.high_resolution, self.output_subsampling_factor = self._resolve_output_resolution()
@@ -247,7 +320,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid.reset()
         self._accuracy_valid_ats.reset()
 
-    def __setup_dataloader_from_config(self, config):
+    def __setup_dataloader_from_config(
+        self, config: Union[DictConfig, Dict], *, is_training: bool = False
+    ) -> Optional[DataLoader]:
+        """Build a diarization dataloader from configuration.
+
+        Args:
+            config: Dataset and dataloader configuration.
+            is_training: Whether to apply training-only shuffling and fixed-epoch oversampling.
+
+        Returns:
+            Configured dataloader, or ``None`` when no manifest is provided.
+        """
         config_values = OmegaConf.to_container(config, resolve=True) if OmegaConf.is_config(config) else config
         config = OmegaConf.create(config_values)
         config.subsampling_factor = self.output_subsampling_factor
@@ -312,12 +396,30 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.data_collection = dataset.collection
         self.collate_ds = dataset
 
+        sampler = None
+        shuffle = config.get('shuffle', False) if is_training else False
+        limit_train_batches = getattr(self._trainer, "limit_train_batches", None)
+        # Lightning interprets float limits as dataset fractions, not fixed batch counts.
+        if is_training and type(limit_train_batches) is int and limit_train_batches > 0:
+            num_samples_per_rank = config.batch_size * limit_train_batches
+            sampler = _OversamplingDistributedSampler(
+                dataset,
+                num_samples_per_rank=num_samples_per_rank,
+                batch_size=config.batch_size,
+                num_replicas=self.world_size,
+                rank=global_rank,
+                shuffle=shuffle,
+                seed=int(os.getenv("PL_GLOBAL_SEED", 0)),
+                trainer=self._trainer,
+            )
+
         dataloader_instance = torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=config.batch_size,
             collate_fn=self.collate_ds.eesd_train_collate_fn,
             drop_last=config.get('drop_last', False),
-            shuffle=False,
+            shuffle=shuffle if sampler is None else False,
+            sampler=sampler,
             num_workers=config.get('num_workers', 1),
             pin_memory=config.get('pin_memory', False),
         )
@@ -326,6 +428,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
     def setup_training_data(self, train_data_config: Optional[Union[DictConfig, Dict]]):
         self._train_dl = self.__setup_dataloader_from_config(
             config=train_data_config,
+            is_training=True,
         )
 
     def setup_validation_data(self, val_data_layer_config: Optional[Union[DictConfig, Dict]]):
