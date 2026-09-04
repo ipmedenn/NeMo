@@ -142,8 +142,7 @@ model:
     sync_max_audio_length: true
 
   loss:
-    _target_: nemo.collections.asr.losses.bce_loss.BCELoss
-    weight: null
+    _target_: nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss
     reduction: mean
 
   lr: 0.0001

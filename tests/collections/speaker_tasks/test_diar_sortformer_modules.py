@@ -228,6 +228,17 @@ class TestSortformerModules_GeneralUtils:
         assert hidden_out_with_grad.grad.shape == hidden_out_with_grad.shape
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("batch_size, n_frames, num_spks", [(2, 7, 4)])
+    def test_forward_speaker_logits_match_sigmoid_wrapper(self, batch_size, n_frames, num_spks):
+        sortformer_modules = SortformerModules(num_spks=num_spks).eval()
+        hidden_out = torch.randn(batch_size, n_frames, sortformer_modules.tf_d_model)
+
+        logits = sortformer_modules.forward_speaker_logits(hidden_out)
+        preds = sortformer_modules.forward_speaker_sigmoids(hidden_out)
+
+        torch.testing.assert_close(torch.sigmoid(logits), preds)
+
+    @pytest.mark.unit
     @pytest.mark.parametrize(
         "batch_size, n_frames, n_spk, encoder_lengths",
         [

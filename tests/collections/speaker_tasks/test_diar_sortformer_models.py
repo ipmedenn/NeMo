@@ -48,6 +48,7 @@ def _create_sortformer_model(
     include_transformer_encoder=True,
     frontend_encoder="conformer",
     causal_attn_rate=0.0,
+    logits_loss=False,
 ):
     if output_subsampling_factor is None:
         output_subsampling_factor = 1 if high_resolution else 8
@@ -157,11 +158,17 @@ def _create_sortformer_model(
         'pre_ln_final_layer_norm': True,
     }
 
-    loss = {
-        '_target_': 'nemo.collections.asr.losses.bce_loss.BCELoss',
-        'weight': None,
-        'reduction': 'mean',
-    }
+    if logits_loss:
+        loss = {
+            '_target_': 'nemo.collections.asr.losses.bce_loss.BCEWithLogitsLoss',
+            'reduction': 'mean',
+        }
+    else:
+        loss = {
+            '_target_': 'nemo.collections.asr.losses.bce_loss.BCELoss',
+            'weight': None,
+            'reduction': 'mean',
+        }
 
     model_config = {
         'sample_rate': 16000,
@@ -201,6 +208,26 @@ class TestSortformerEncLabelModelOffline:
         confdict = sortformer_diar_model.to_config_dict()
         instance2 = SortformerEncLabelModel.from_config_dict(confdict)
         assert isinstance(instance2, SortformerEncLabelModel)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("audio_shape, audio_lengths", [((2, 4000), (4000, 3200))])
+    def test_forward_returns_probabilities_by_default_and_aligned_logits_on_request(
+        self, sortformer_model, audio_shape, audio_lengths
+    ):
+        model = sortformer_model.eval()
+        audio = torch.randn(audio_shape)
+        audio_lengths = torch.tensor(audio_lengths)
+        with torch.no_grad():
+            torch.manual_seed(0)
+            default_preds = model(audio, audio_lengths)
+            torch.manual_seed(0)
+            preds, logits = model(audio, audio_lengths, return_logits=True)
+
+        valid_mask = preds.sum(dim=-1) > 0
+        assert isinstance(default_preds, torch.Tensor)
+        assert preds.shape == logits.shape == default_preds.shape
+        torch.testing.assert_close(default_preds, preds)
+        torch.testing.assert_close(torch.sigmoid(logits[valid_mask]), preds[valid_mask])
 
     @pytest.mark.unit
     @pytest.mark.parametrize("streaming_mode", [False, True])
@@ -266,6 +293,61 @@ class TestSortformerEncLabelModelOffline:
         assert diff <= 1e-6
 
 
+class TestSortformerEncLabelModelLossRepresentation:
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "step_name, logits_loss, expected_keyword",
+        [
+            ("training", False, "probs"),
+            ("validation", True, "logits"),
+        ],
+    )
+    def test_training_and_validation_use_configured_loss_representation(
+        self, step_name, logits_loss, expected_keyword
+    ):
+        model = _create_sortformer_model(logits_loss=logits_loss)
+        logits = torch.randn(2, 5, model.sortformer_modules.n_spk, requires_grad=True)
+        preds = torch.sigmoid(logits)
+        outputs = (preds, logits) if logits_loss else preds
+        targets = torch.randint(0, 2, preds.shape).float()
+        target_lens = torch.tensor([5, 3])
+        batch = (torch.randn(2, 80), torch.tensor([80, 64]), targets, target_lens)
+        model._optimizer = SimpleNamespace(param_groups=[{"lr": 1e-3}])
+        model._trainer = SimpleNamespace(val_dataloaders=[])
+        model.validation_step_outputs = []
+
+        with (
+            patch.object(model, "forward", return_value=outputs) as forward_mock,
+            patch.object(model.loss, "forward", wraps=model.loss.forward) as loss_forward,
+            patch.object(model, "log_dict"),
+        ):
+            if step_name == "training":
+                metrics = model.training_step(batch, batch_idx=0)
+                loss = metrics["loss"]
+            else:
+                metrics = model.validation_step(batch, batch_idx=0)
+                loss = metrics["val_loss"]
+
+        assert torch.isfinite(loss)
+        assert forward_mock.call_args.kwargs["return_logits"] is logits_loss
+        assert len(loss_forward.call_args_list) == 2
+        unexpected_keyword = "probs" if expected_keyword == "logits" else "logits"
+        for loss_call in loss_forward.call_args_list:
+            assert expected_keyword in loss_call.kwargs
+            assert unexpected_keyword not in loss_call.kwargs
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("strict", [True])
+    def test_logits_loss_strictly_loads_legacy_bce_state_dict(self, strict):
+        legacy_model = _create_sortformer_model(logits_loss=False)
+        logits_model = _create_sortformer_model(logits_loss=True)
+
+        load_result = logits_model.load_state_dict(legacy_model.state_dict(), strict=strict)
+
+        assert not load_result.missing_keys
+        assert not load_result.unexpected_keys
+
+
 class TestSortformerEncLabelModelStreaming:
     @pytest.mark.unit
     @pytest.mark.parametrize("field_name", ["spkcache_len", "chunk_left_context"])
@@ -279,6 +361,22 @@ class TestSortformerEncLabelModelStreaming:
         confdict = sortformer_diar_model.to_config_dict()
         instance2 = SortformerEncLabelModel.from_config_dict(confdict)
         assert isinstance(instance2, SortformerEncLabelModel)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("async_streaming", [False, True])
+    def test_high_resolution_streaming_returns_aligned_logits(self, async_streaming):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        model.streaming_mode = True
+        model.async_streaming = async_streaming
+        audio = torch.randn(2, 4000)
+        audio_lengths = torch.tensor([4000, 3200])
+
+        with torch.no_grad():
+            preds, logits = model(audio, audio_lengths, return_logits=True)
+
+        valid_mask = preds.sum(dim=-1) > 0
+        assert preds.shape == logits.shape
+        torch.testing.assert_close(torch.sigmoid(logits[valid_mask]), preds[valid_mask])
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -622,6 +720,74 @@ class TestSortformerEncLabelModelHighResolution:
         assert actual.is_contiguous()
         assert profiler.section_calls["high_resolution_extract"] == 1
         assert profiler.section_times["high_resolution_extract"] > 0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "pred_frames, logit_frames, error_match",
+        [
+            (3, None, "total_logits is required"),
+            (3, 2, "total_logits and total_preds must have the same shape"),
+        ],
+    )
+    def test_streaming_step_validates_cumulative_logits(self, pred_frames, logit_frames, error_match):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        num_speakers = model.sortformer_modules.n_spk
+        total_preds = torch.zeros(1, pred_frames, num_speakers)
+        total_logits = None if logit_frames is None else torch.zeros(1, logit_frames, num_speakers)
+
+        with pytest.raises(ValueError, match=error_match):
+            model.forward_streaming_step(
+                processed_signal=torch.zeros(1, 1, model.encoder._feat_in),
+                processed_signal_length=torch.tensor([1]),
+                streaming_state=model.sortformer_modules.init_streaming_state(batch_size=1),
+                total_preds=total_preds,
+                return_logits=True,
+                total_logits=total_logits,
+            )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("speaker_permutation, num_input_frames", [((2, 0, 3, 1), 120)])
+    def test_streaming_step_accumulates_permuted_and_sliced_logits(self, speaker_permutation, num_input_frames):
+        model = _create_sortformer_model(high_resolution=True).eval()
+        streaming_state = model.sortformer_modules.init_streaming_state(batch_size=1)
+        streaming_state.spk_perm = torch.tensor([speaker_permutation])
+        total_preds = torch.zeros(1, 0, model.sortformer_modules.n_spk)
+        processed_signal = torch.randn(1, num_input_frames, model.encoder._feat_in)
+        processed_signal_length = torch.tensor([num_input_frames])
+        captured = {}
+        forward_infer = model.forward_infer
+
+        def capture_forward_infer(*args, **kwargs):
+            outputs = forward_infer(*args, **kwargs)
+            captured["logits"] = outputs[1]
+            return outputs
+
+        with torch.no_grad(), patch.object(model, "forward_infer", side_effect=capture_forward_infer):
+            streaming_state, total_preds, total_logits = model.forward_streaming_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                streaming_state=streaming_state,
+                total_preds=total_preds,
+                return_logits=True,
+            )
+            first_logits = total_logits.clone()
+
+            inverse_permutation = torch.argsort(torch.tensor(speaker_permutation))
+            expected_logits = captured["logits"][:, : total_logits.shape[1], inverse_permutation]
+            torch.testing.assert_close(total_logits, expected_logits)
+
+            _, total_preds, total_logits = model.forward_streaming_step(
+                processed_signal=processed_signal,
+                processed_signal_length=processed_signal_length,
+                streaming_state=streaming_state,
+                total_preds=total_preds,
+                total_logits=total_logits,
+                return_logits=True,
+            )
+
+        assert total_logits.shape == total_preds.shape
+        torch.testing.assert_close(total_logits[:, : first_logits.shape[1]], first_logits)
+        torch.testing.assert_close(torch.sigmoid(total_logits), total_preds)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
