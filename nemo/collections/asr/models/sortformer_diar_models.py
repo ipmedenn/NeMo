@@ -1555,6 +1555,37 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         target_lens = target_lens.clamp(max=common_num_frames)
         return preds, targets, target_lens
 
+    @staticmethod
+    def _speaker_count_metrics(
+        preds: torch.Tensor,
+        targets: torch.Tensor,
+        target_lens: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute speaker-count errors over valid frames.
+
+        Args:
+            preds: Speaker probabilities with shape ``(B, T, S)``.
+            targets: Hard speaker targets with shape ``(B, T, S)``.
+            target_lens: Number of valid frames per sample with shape ``(B,)``.
+
+        Returns:
+            Scalar FP32 tensors containing the batch-mean speaker-count absolute
+            error and exact-match accuracy. Activity outside valid frames is ignored.
+        """
+        num_frames = preds.shape[1]
+        valid = (
+            torch.arange(num_frames, device=preds.device).unsqueeze(0) < target_lens.to(preds.device).unsqueeze(1)
+        ).unsqueeze(-1)
+
+        predicted_present = ((preds > 0.5) & valid).any(dim=1)
+        target_present = ((targets > 0.5) & valid).any(dim=1)
+
+        predicted_count = predicted_present.sum(dim=1)
+        target_count = target_present.sum(dim=1)
+        count_error = (predicted_count - target_count).abs().float()
+
+        return count_error.mean(), (predicted_count == target_count).float().mean()
+
     def _activity_loss(
         self,
         activity_logits: torch.Tensor,
@@ -1767,6 +1798,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_train_ats(preds, targets_ats, target_lens)
         train_f1_acc_ats, _, _ = self._accuracy_train_ats.compute()
 
+        train_spk_count_mae, train_spk_count_acc = self._speaker_count_metrics(preds, targets, target_lens)
+
         train_metrics = {
             'loss': loss,
             'ats_loss': ats_loss,
@@ -1778,6 +1811,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'train_precision': train_precision,
             'train_recall': train_recall,
             'train_f1_acc_ats': train_f1_acc_ats,
+            'train_spk_count_mae': train_spk_count_mae,
+            'train_spk_count_acc': train_spk_count_acc,
         }
         return train_metrics
 
@@ -1900,6 +1935,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self._accuracy_valid_ats(preds, targets_ats, target_lens)
         valid_f1_acc_ats, _, _ = self._accuracy_valid_ats.compute()
 
+        val_spk_count_mae, val_spk_count_acc = self._speaker_count_metrics(preds, targets, target_lens)
+
         self._accuracy_valid.reset()
         self._accuracy_valid_ats.reset()
 
@@ -1913,6 +1950,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_precision': val_precision,
             'val_recall': val_recall,
             'val_f1_acc_ats': valid_f1_acc_ats,
+            'val_spk_count_mae': val_spk_count_mae,
+            'val_spk_count_acc': val_spk_count_acc,
         }
         return val_metrics
 
@@ -2002,6 +2041,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         val_precision_mean = torch.stack([x['val_precision'] for x in outputs]).mean()
         val_recall_mean = torch.stack([x['val_recall'] for x in outputs]).mean()
         val_f1_acc_ats_mean = torch.stack([x['val_f1_acc_ats'] for x in outputs]).mean()
+        val_spk_count_mae_mean = torch.stack([x['val_spk_count_mae'] for x in outputs]).mean()
+        val_spk_count_acc_mean = torch.stack([x['val_spk_count_acc'] for x in outputs]).mean()
 
         self._reset_valid_metrics()
 
@@ -2015,6 +2056,8 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'val_precision': val_precision_mean,
             'val_recall': val_recall_mean,
             'val_f1_acc_ats': val_f1_acc_ats_mean,
+            'val_spk_count_mae': val_spk_count_mae_mean,
+            'val_spk_count_acc': val_spk_count_acc_mean,
         }
         return {'log': multi_val_metrics}
 

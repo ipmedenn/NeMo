@@ -409,6 +409,7 @@ class TestSortformerEncLabelModelLossRepresentation:
         [
             ("training", False, 0.0, 0.0, "probs", False),
             ("training", False, 0.3, 0.0, "probs", True),
+            ("validation", False, 0.0, 0.0, "probs", False),
             ("validation", False, 0.0, 0.4, "probs", True),
             ("validation", True, 0.2, 0.4, "logits", True),
         ],
@@ -462,6 +463,11 @@ class TestSortformerEncLabelModelLossRepresentation:
         metric_prefix = "val_" if step_name == "validation" else ""
         assert f"{metric_prefix}activity_loss" in logged_metrics
         assert f"{metric_prefix}phantom_loss" in logged_metrics
+        spk_count_prefix = "val" if step_name == "validation" else "train"
+        for metric_name in ("spk_count_mae", "spk_count_acc"):
+            metric = logged_metrics[f"{spk_count_prefix}_{metric_name}"]
+            assert metric.ndim == 0
+            assert torch.isfinite(metric)
         expected_loss = (
             model.ats_weight * logged_metrics[f"{metric_prefix}ats_loss"]
             + model.pil_weight * logged_metrics[f"{metric_prefix}pil_loss"]
@@ -480,6 +486,103 @@ class TestSortformerEncLabelModelLossRepresentation:
 
         assert not load_result.missing_keys
         assert not load_result.unexpected_keys
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("preds", "targets", "target_lens", "expected_mae", "expected_acc"),
+        [
+            (
+                (((0.9, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (((0.0, 0.0, 0.8, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (3,),
+                0.0,
+                1.0,
+            ),
+            (
+                (((0.9, 0.8, 0.7, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (((0.0, 0.0, 0.0, 0.9), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (3,),
+                2.0,
+                0.0,
+            ),
+            (
+                (((0.9, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (((0.0, 0.8, 0.7, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (3,),
+                1.0,
+                0.0,
+            ),
+            (
+                (((0.0, 0.9, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.8, 0.0)),),
+                (((0.0, 0.0, 0.0, 0.9), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),),
+                (2,),
+                0.0,
+                1.0,
+            ),
+            (
+                (
+                    ((0.5, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),
+                    ((0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),
+                ),
+                (
+                    ((0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),
+                    ((0.0, 0.0, 0.5, 0.0), (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)),
+                ),
+                (3, 3),
+                0.0,
+                1.0,
+            ),
+        ],
+        ids=["permutation", "over-count", "under-count", "padded-activity", "strict-threshold"],
+    )
+    def test_speaker_count_metrics(
+        self,
+        preds,
+        targets,
+        target_lens,
+        expected_mae,
+        expected_acc,
+    ):
+        spk_count_mae, spk_count_acc = SortformerEncLabelModel._speaker_count_metrics(
+            torch.tensor(preds),
+            torch.tensor(targets),
+            torch.tensor(target_lens),
+        )
+
+        torch.testing.assert_close(spk_count_mae, torch.tensor(expected_mae))
+        torch.testing.assert_close(spk_count_acc, torch.tensor(expected_acc))
+
+    @pytest.mark.unit
+    def test_multi_validation_epoch_end_averages_speaker_count_metrics(self):
+        model = _create_sortformer_model()
+        other_metrics = {
+            "val_loss": torch.tensor(0.0),
+            "val_ats_loss": torch.tensor(0.0),
+            "val_pil_loss": torch.tensor(0.0),
+            "val_activity_loss": torch.tensor(0.0),
+            "val_phantom_loss": torch.tensor(0.0),
+            "val_f1_acc": torch.tensor(0.0),
+            "val_precision": torch.tensor(0.0),
+            "val_recall": torch.tensor(0.0),
+            "val_f1_acc_ats": torch.tensor(0.0),
+        }
+        outputs = [
+            {
+                **other_metrics,
+                "val_spk_count_mae": torch.tensor(1.0),
+                "val_spk_count_acc": torch.tensor(0.25),
+            },
+            {
+                **other_metrics,
+                "val_spk_count_mae": torch.tensor(3.0),
+                "val_spk_count_acc": torch.tensor(0.75),
+            },
+        ]
+
+        metrics = model.multi_validation_epoch_end(outputs)["log"]
+
+        torch.testing.assert_close(metrics["val_spk_count_mae"], torch.tensor(2.0))
+        torch.testing.assert_close(metrics["val_spk_count_acc"], torch.tensor(0.5))
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
