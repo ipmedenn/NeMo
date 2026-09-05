@@ -281,6 +281,31 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         self.max_batch_dur = self._cfg.get("max_batch_dur", 20000)
         self.rttms_mask_mats: List[torch.Tensor] = None  # Used when GT diarization needs to be tested.
 
+    def on_train_start(self) -> None:
+        """Repair a scheduler's restored max_steps when a resumed run changes the training horizon."""
+        super().on_train_start()
+        if self.trainer is None:
+            return
+
+        max_steps = self.trainer.max_steps
+        if max_steps is None or max_steps <= 0:
+            return
+
+        schedulers = self.lr_schedulers()
+        if schedulers is None:
+            schedulers = []
+        elif not isinstance(schedulers, (list, tuple)):
+            schedulers = [schedulers]
+
+        for scheduler in schedulers:
+            if hasattr(scheduler, "max_steps") and scheduler.max_steps != max_steps:
+                restored_max_steps = scheduler.max_steps
+                scheduler.max_steps = max_steps
+                logging.info(
+                    f"Updated restored scheduler max_steps from {restored_max_steps} to {max_steps} "
+                    "to match trainer.max_steps."
+                )
+
     def add_rttms_mask_mats(self, rttms_mask_mats, device: torch.device):
         """
         Check if the rttms_mask_mats is empty then add it to the list

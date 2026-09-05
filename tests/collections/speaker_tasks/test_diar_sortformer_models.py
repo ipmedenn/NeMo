@@ -226,6 +226,66 @@ class TestSortformerEncLabelModelOffline:
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
+        (
+            "trainer_attached",
+            "trainer_max_steps",
+            "scheduler_max_steps",
+            "scheduler_shape",
+            "expected_max_steps",
+            "expected_updates",
+        ),
+        [
+            (True, 200, 100, "single", 200, [200]),
+            (True, 200, 200, "tuple", 200, []),
+            (False, None, 100, "single", 100, []),
+            (True, None, 100, "single", 100, []),
+            (True, 0, 100, "single", 100, []),
+            (True, -1, 100, "single", 100, []),
+        ],
+        ids=["stale", "matching-and-no-max-steps", "no-trainer", "no-horizon", "zero-horizon", "negative-horizon"],
+    )
+    def test_on_train_start_repairs_scheduler_max_steps(
+        self,
+        trainer_attached,
+        trainer_max_steps,
+        scheduler_max_steps,
+        scheduler_shape,
+        expected_max_steps,
+        expected_updates,
+    ):
+        class FakeScheduler:
+            def __init__(self, max_steps):
+                self._max_steps = max_steps
+                self.updates = []
+
+            @property
+            def max_steps(self):
+                return self._max_steps
+
+            @max_steps.setter
+            def max_steps(self, value):
+                self._max_steps = value
+                self.updates.append(value)
+
+        model = _create_sortformer_model()
+        model._trainer = SimpleNamespace(max_steps=trainer_max_steps) if trainer_attached else None
+        scheduler = FakeScheduler(scheduler_max_steps)
+        scheduler_without_max_steps = SimpleNamespace()
+        schedulers = scheduler if scheduler_shape == "single" else (scheduler, scheduler_without_max_steps)
+
+        with patch.object(model, "lr_schedulers", return_value=schedulers) as lr_schedulers:
+            model.on_train_start()
+
+        assert scheduler.max_steps == expected_max_steps
+        assert scheduler.updates == expected_updates
+        assert not hasattr(scheduler_without_max_steps, "max_steps")
+        if trainer_attached and trainer_max_steps is not None and trainer_max_steps > 0:
+            lr_schedulers.assert_called_once_with()
+        else:
+            lr_schedulers.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
         "activity_weight, audio_shape, audio_lengths",
         [
             (0.0, (2, 4000), (4000, 3200)),
