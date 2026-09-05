@@ -141,11 +141,14 @@ class SortformerModules(NeuralModule, Exportable):
         use_learnable_sil_emb: bool = False,
         upsample_factor: int = 1,
         async_desync_updates: bool = False,
-    ):
+        use_activity_head: bool = False,
+    ) -> None:
         super().__init__()
         self._validate_integer_parameter('num_spks', num_spks, 1)
         if not isinstance(upsample_factor, int) or isinstance(upsample_factor, bool) or upsample_factor < 1:
             raise ValueError(f"upsample_factor must be a positive integer, got {upsample_factor}")
+        if not isinstance(use_activity_head, bool):
+            raise TypeError(f"use_activity_head must be a boolean, got {type(use_activity_head).__name__}")
         # General params
         self.subsampling_factor = subsampling_factor
         self.fc_d_model = fc_d_model
@@ -157,6 +160,14 @@ class SortformerModules(NeuralModule, Exportable):
         self.hidden_to_spks.requires_grad_(False)
         self.first_hidden_to_hidden = nn.Linear(self.hidden_size, self.hidden_size)
         self.single_hidden_to_spks = nn.Linear(self.hidden_size, self.n_spk)
+        self.activity_head = (
+            nn.Sequential(
+                nn.LayerNorm(self.hidden_size),
+                nn.Linear(self.hidden_size, 3),
+            )
+            if use_activity_head
+            else None
+        )
         self.dropout = nn.Dropout(dropout_rate)
         self.encoder_proj = nn.Linear(self.fc_d_model, self.tf_d_model)
         self.subpixel_upsample = None
@@ -338,6 +349,19 @@ class SortformerModules(NeuralModule, Exportable):
                 Shape: (batch_size, n_frames, n_spk)
         """
         return torch.sigmoid(self.forward_speaker_logits(hidden_out))
+
+    def forward_activity_logits(self, hidden_out: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return raw silence, single-speaker, and overlap logits when the auxiliary head is enabled.
+
+        Args:
+            hidden_out: Post-transformer hidden states with shape ``(B, T, H)``.
+
+        Returns:
+            Raw activity logits with shape ``(B, T, 3)``, or ``None`` when the head is disabled.
+        """
+        if self.activity_head is None:
+            return None
+        return self.activity_head(hidden_out)
 
     def upsample_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
