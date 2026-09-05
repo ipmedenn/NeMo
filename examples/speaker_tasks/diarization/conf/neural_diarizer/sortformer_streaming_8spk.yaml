@@ -18,8 +18,8 @@ model:
   pil_weight: 0.75
   ats_weight: 0.25
   ats_tolerance: 0
-  activity_weight: 0.0  # Weight for the optional silence/single-speaker/overlap activity head.
-  phantom_weight: 0.0  # Weight for high-confidence predictions on target-empty speaker channels.
+  activity_weight: 0.5  # Weight for the optional silence/single-speaker/overlap activity head.
+  phantom_weight: 0.05  # Weight for high-confidence predictions on target-empty speaker channels.
   phantom_target: both  # Empty channels must be shared by PIL and ATS alignments.
   phantom_threshold: 0.25  # Minimum detached speaker probability selected for phantom loss.
   phantom_temperature: 0.5  # Temperature for normalized log-mean-exp phantom aggregation.
@@ -27,6 +27,10 @@ model:
   high_resolution: true
   output_subsampling_factor: 1
   streaming_mode: true
+  max_causal_tail_len: 222  # Longest sequence suffix trained with block-causal attention; 0 turns it off.
+  causal_tail_prob: 0.5  # Chance of enabling it per training batch; validation and inference always use full attention.
+  min_causal_tail_block_size: 1  # Smallest bidirectional tail block, measured in encoder frames.
+  max_causal_tail_block_size: 1  # Largest tail block; sampled uniformly between this and the minimum.
 
   model_defaults:
     fc_d_model: 512

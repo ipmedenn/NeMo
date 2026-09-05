@@ -18,6 +18,7 @@ import math
 import os
 import random
 from collections import OrderedDict
+from numbers import Real
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
@@ -224,6 +225,48 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         """
         self._trainer = trainer if trainer else None
         self._cfg = cfg
+        self.max_causal_tail_len = self._cfg.get("max_causal_tail_len", 0)
+        self.causal_tail_prob = self._cfg.get("causal_tail_prob", 1.0)
+        self.min_causal_tail_block_size = self._cfg.get("min_causal_tail_block_size", 1)
+        self.max_causal_tail_block_size = self._cfg.get("max_causal_tail_block_size", 1)
+        if not isinstance(self.max_causal_tail_len, int) or isinstance(self.max_causal_tail_len, bool):
+            raise TypeError(
+                "max_causal_tail_len must be a non-negative integer, "
+                f"got {type(self.max_causal_tail_len).__name__}."
+            )
+        if self.max_causal_tail_len < 0:
+            raise ValueError(f"max_causal_tail_len must be non-negative, got {self.max_causal_tail_len}.")
+        if not isinstance(self.causal_tail_prob, Real) or isinstance(self.causal_tail_prob, bool):
+            raise TypeError(
+                f"causal_tail_prob must be a real number in [0.0, 1.0], got {type(self.causal_tail_prob).__name__}."
+            )
+        if not 0.0 <= self.causal_tail_prob <= 1.0:
+            raise ValueError(f"causal_tail_prob must be in [0.0, 1.0], got {self.causal_tail_prob}.")
+        if not isinstance(self.min_causal_tail_block_size, int) or isinstance(self.min_causal_tail_block_size, bool):
+            raise TypeError(
+                "min_causal_tail_block_size must be a positive integer, "
+                f"got {type(self.min_causal_tail_block_size).__name__}."
+            )
+        if not isinstance(self.max_causal_tail_block_size, int) or isinstance(self.max_causal_tail_block_size, bool):
+            raise TypeError(
+                "max_causal_tail_block_size must be a positive integer, "
+                f"got {type(self.max_causal_tail_block_size).__name__}."
+            )
+        if self.min_causal_tail_block_size < 1:
+            raise ValueError(f"min_causal_tail_block_size must be at least 1, got {self.min_causal_tail_block_size}.")
+        if self.max_causal_tail_block_size < self.min_causal_tail_block_size:
+            raise ValueError(
+                "max_causal_tail_block_size must be greater than or equal to "
+                f"min_causal_tail_block_size, got {self.max_causal_tail_block_size} < "
+                f"{self.min_causal_tail_block_size}."
+            )
+        causal_tail_enabled = self.max_causal_tail_len > 0 and self.causal_tail_prob > 0
+        if causal_tail_enabled and self.max_causal_tail_block_size > self.max_causal_tail_len:
+            raise ValueError(
+                "max_causal_tail_block_size must be less than or equal to max_causal_tail_len "
+                "when causal-tail augmentation is enabled, "
+                f"got {self.max_causal_tail_block_size} > {self.max_causal_tail_len}."
+            )
         self.high_resolution, self.output_subsampling_factor = self._resolve_output_resolution()
 
         if self._trainer:
@@ -273,6 +316,21 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         # Async rows are ragged; padding to full state capacity keeps the encoder time dimension fixed.
         self.async_pad_to_max = self._cfg.get("async_pad_to_max", False)
         self.streaming_mode = self._cfg.get("streaming_mode", False)
+        if causal_tail_enabled:
+            if not self.streaming_mode:
+                raise ValueError("Causal-tail augmentation requires streaming_mode=True.")
+            if not hasattr(self.encoder, "causal_tail_len") or not hasattr(self.encoder, "causal_tail_block_size"):
+                raise ValueError(
+                    "Causal-tail augmentation requires an encoder that exposes causal_tail_len "
+                    "and causal_tail_block_size; "
+                    f"got {type(self.encoder).__name__}."
+                )
+            encoder_attn_mode = getattr(self.encoder, "attn_mode", None)
+            if encoder_attn_mode != "full":
+                raise ValueError(
+                    "Causal-tail augmentation requires TransformerEncoder with attn_mode='full'; "
+                    f"got {type(self.encoder).__name__} with attn_mode={encoder_attn_mode!r}."
+                )
         if self.streaming_mode:
             # Validate streaming parameters once at initialization for streaming models
             self._check_streaming_parameters()
@@ -1055,65 +1113,89 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             )
             processed_signal = torch.cat([processed_signal, pad_tensor], dim=2)
 
-        att_mod = False
-        if self.training:
-            rand_num = random.random()
-            if rand_num < self.sortformer_modules.causal_attn_rate:
-                self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
-                if self.transformer_encoder is not None:
-                    self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
-                att_mod = True
-
-        total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
-        if return_logits:
-            total_logits = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
-            total_activity_logits = (
-                torch.zeros((batch_size, 0, 3), device=self.device)
-                if self.sortformer_modules.activity_head is not None
-                else None
-            )
-
-        feat_len = processed_signal.shape[2]
-        num_chunks = math.ceil(
-            feat_len / (self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor)
-        )
-        streaming_loader = self.sortformer_modules.streaming_feat_loader(
-            feat_seq=processed_signal,
-            feat_seq_length=processed_signal_length,
-            feat_seq_offset=processed_signal_offset,
-        )
-        for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
-            streaming_loader,
-            total=num_chunks,
-            desc="Streaming Steps",
-            disable=self.training,
+        causal_tail_len, causal_tail_block_size = 0, 1
+        if (
+            self.training
+            and self.max_causal_tail_len > 0
+            and self.causal_tail_prob > 0
+            and random.random() < self.causal_tail_prob
         ):
-            if return_logits:
-                streaming_state, total_preds, total_logits, total_activity_logits = self.forward_streaming_step(
-                    processed_signal=chunk_feat_seq_t,
-                    processed_signal_length=feat_lengths,
-                    streaming_state=streaming_state,
-                    total_preds=total_preds,
-                    total_logits=total_logits,
-                    total_activity_logits=total_activity_logits,
-                    left_offset=left_offset,
-                    right_offset=right_offset,
-                    return_logits=True,
-                )
+            causal_tail_len = random.randint(1, self.max_causal_tail_len)
+            # Sample independently of the selected tail length. A larger block intentionally
+            # makes that tail a single bidirectional block.
+            if self.min_causal_tail_block_size == self.max_causal_tail_block_size:
+                causal_tail_block_size = self.min_causal_tail_block_size
             else:
-                streaming_state, total_preds = self.forward_streaming_step(
-                    processed_signal=chunk_feat_seq_t,
-                    processed_signal_length=feat_lengths,
-                    streaming_state=streaming_state,
-                    total_preds=total_preds,
-                    left_offset=left_offset,
-                    right_offset=right_offset,
+                causal_tail_block_size = random.randint(
+                    self.min_causal_tail_block_size, self.max_causal_tail_block_size
+                )
+        if hasattr(self.encoder, "causal_tail_len") and hasattr(self.encoder, "causal_tail_block_size"):
+            self.encoder.causal_tail_len = causal_tail_len
+            self.encoder.causal_tail_block_size = causal_tail_block_size
+
+        att_mod = False
+        try:
+            if self.training:
+                rand_num = random.random()
+                if rand_num < self.sortformer_modules.causal_attn_rate:
+                    self.encoder.att_context_size = [-1, self.sortformer_modules.causal_attn_rc]
+                    att_mod = True
+                    if self.transformer_encoder is not None:
+                        self.transformer_encoder.diag = self.sortformer_modules.causal_attn_rc
+
+            total_preds = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
+            if return_logits:
+                total_logits = torch.zeros((batch_size, 0, self.sortformer_modules.n_spk), device=self.device)
+                total_activity_logits = (
+                    torch.zeros((batch_size, 0, 3), device=self.device)
+                    if self.sortformer_modules.activity_head is not None
+                    else None
                 )
 
-        if att_mod:
-            self.encoder.att_context_size = [-1, -1]
-            if self.transformer_encoder is not None:
-                self.transformer_encoder.diag = None
+            feat_len = processed_signal.shape[2]
+            num_chunks = math.ceil(
+                feat_len / (self.sortformer_modules.chunk_len * self.sortformer_modules.subsampling_factor)
+            )
+            streaming_loader = self.sortformer_modules.streaming_feat_loader(
+                feat_seq=processed_signal,
+                feat_seq_length=processed_signal_length,
+                feat_seq_offset=processed_signal_offset,
+            )
+            for _, chunk_feat_seq_t, feat_lengths, left_offset, right_offset in tqdm(
+                streaming_loader,
+                total=num_chunks,
+                desc="Streaming Steps",
+                disable=self.training,
+            ):
+                if return_logits:
+                    streaming_state, total_preds, total_logits, total_activity_logits = self.forward_streaming_step(
+                        processed_signal=chunk_feat_seq_t,
+                        processed_signal_length=feat_lengths,
+                        streaming_state=streaming_state,
+                        total_preds=total_preds,
+                        total_logits=total_logits,
+                        total_activity_logits=total_activity_logits,
+                        left_offset=left_offset,
+                        right_offset=right_offset,
+                        return_logits=True,
+                    )
+                else:
+                    streaming_state, total_preds = self.forward_streaming_step(
+                        processed_signal=chunk_feat_seq_t,
+                        processed_signal_length=feat_lengths,
+                        streaming_state=streaming_state,
+                        total_preds=total_preds,
+                        left_offset=left_offset,
+                        right_offset=right_offset,
+                    )
+        finally:
+            if hasattr(self.encoder, "causal_tail_len") and hasattr(self.encoder, "causal_tail_block_size"):
+                self.encoder.causal_tail_len = 0
+                self.encoder.causal_tail_block_size = 1
+            if att_mod:
+                self.encoder.att_context_size = [-1, -1]
+                if self.transformer_encoder is not None:
+                    self.transformer_encoder.diag = None
 
         del processed_signal, processed_signal_length
 

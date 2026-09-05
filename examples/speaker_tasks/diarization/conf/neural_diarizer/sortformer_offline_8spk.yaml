@@ -18,7 +18,7 @@ model:
   pil_weight: 0.5
   ats_weight: 0.5
   ats_tolerance: 0
-  activity_weight: 0.0  # Weight for the optional silence/single-speaker/overlap activity head.
+  activity_weight: 0.5  # Weight for the optional silence/single-speaker/overlap activity head.
   phantom_weight: 0.0  # Weight for high-confidence predictions on target-empty speaker channels.
   phantom_target: both  # Empty channels must be shared by PIL and ATS alignments.
   phantom_threshold: 0.25  # Minimum detached speaker probability selected for phantom loss.

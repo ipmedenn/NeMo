@@ -49,6 +49,12 @@ def _create_sortformer_model(
     include_transformer_encoder=True,
     frontend_encoder="conformer",
     causal_attn_rate=0.0,
+    streaming_mode=False,
+    max_causal_tail_len=0,
+    causal_tail_prob=1.0,
+    min_causal_tail_block_size=1,
+    max_causal_tail_block_size=1,
+    encoder_attn_mode="full",
     logits_loss=False,
     activity_weight=0.0,
     phantom_weight=0.0,
@@ -72,10 +78,15 @@ def _create_sortformer_model(
         'high_resolution': high_resolution,
         'output_subsampling_factor': output_subsampling_factor,
         'async_streaming': False,
-        'streaming_mode': False,
+        'streaming_mode': streaming_mode,
+        'max_causal_tail_len': max_causal_tail_len,
+        'causal_tail_prob': causal_tail_prob,
+        'min_causal_tail_block_size': min_causal_tail_block_size,
+        'max_causal_tail_block_size': max_causal_tail_block_size,
     }
+    transformer_frontend = frontend_encoder in {"transformer", "streaming_transformer"}
     model_defaults = {
-        'fc_d_model': 128 if frontend_encoder == "transformer" else 32,
+        'fc_d_model': 128 if transformer_frontend else 32,
         'tf_d_model': 16,
     }
     preprocessor = {
@@ -85,7 +96,7 @@ def _create_sortformer_model(
         'sample_rate': 16000,
         'window_stride': 0.01,
         'window': 'hann',
-        'features': 128 if frontend_encoder == "transformer" else 80,
+        'features': 128 if transformer_frontend else 80,
         'n_fft': 512,
         'frame_splicing': 1,
         'dither': 0.00001,
@@ -100,10 +111,14 @@ def _create_sortformer_model(
         'causal_attn_rate': causal_attn_rate,
     }
 
-    if frontend_encoder == "transformer":
+    if transformer_frontend:
         # Keep the production Transformer architecture and options, but scale its depth and width for CPU unit tests.
         encoder = {
-            '_target_': 'nemo.collections.asr.modules.TransformerEncoder',
+            '_target_': (
+                'nemo.collections.asr.modules.StreamingTransformerEncoder'
+                if frontend_encoder == "streaming_transformer"
+                else 'nemo.collections.asr.modules.TransformerEncoder'
+            ),
             'feat_in': preprocessor['features'],
             'feat_out': -1,
             'n_layers': 1,
@@ -118,12 +133,15 @@ def _create_sortformer_model(
             'qkv_bias': False,
             'qk_norm': False,
             'pre_block_norm': True,
-            'attn_mode': 'full',
+            'causal_tail_len': 0,
+            'causal_tail_block_size': 1,
             'drop_rate': 0.1,
             'dropout_pre_encoder': 0.1,
             'dropout_emb': 0.0,
             'sync_max_audio_length': True,
         }
+        if encoder_attn_mode is not None:
+            encoder['attn_mode'] = encoder_attn_mode
     else:
         encoder = {
             '_target_': 'nemo.collections.asr.modules.ConformerEncoder',
@@ -193,6 +211,11 @@ def _create_sortformer_model(
         'max_num_of_spks': 4,
         'high_resolution': high_resolution,
         'output_subsampling_factor': output_subsampling_factor,
+        'streaming_mode': streaming_mode,
+        'max_causal_tail_len': max_causal_tail_len,
+        'causal_tail_prob': causal_tail_prob,
+        'min_causal_tail_block_size': min_causal_tail_block_size,
+        'max_causal_tail_block_size': max_causal_tail_block_size,
         'model_defaults': DictConfig(model_defaults),
         'encoder': DictConfig(encoder),
         'sortformer_modules': DictConfig(sortformer_modules),
@@ -580,6 +603,194 @@ class TestSortformerEncLabelModelStreaming:
     @pytest.mark.parametrize("field_name", ["spkcache_len", "chunk_left_context"])
     def test_model_dependent_streaming_overrides_default_to_none(self, field_name):
         assert getattr(DiarizationConfig(), field_name) is None
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        (
+            "training",
+            "causal_tail_prob",
+            "min_block_size",
+            "max_block_size",
+            "random_values",
+            "expected_runtime_values",
+            "expected_randint_args",
+        ),
+        [
+            (True, 1.0, 1, 1, (4,), (4, 1), [(1, 5)]),
+            (True, 1.0, 2, 4, (2, 4), (2, 4), [(1, 5), (2, 4)]),
+            (True, 0.0, 2, 4, (), (0, 1), []),
+            (False, 1.0, 2, 4, (), (0, 1), []),
+        ],
+    )
+    def test_causal_tail_sampling_and_reset(
+        self,
+        training,
+        causal_tail_prob,
+        min_block_size,
+        max_block_size,
+        random_values,
+        expected_runtime_values,
+        expected_randint_args,
+    ):
+        model = _create_sortformer_model(
+            frontend_encoder="transformer",
+            streaming_mode=True,
+            max_causal_tail_len=5,
+            causal_tail_prob=causal_tail_prob,
+            min_causal_tail_block_size=min_block_size,
+            max_causal_tail_block_size=max_block_size,
+        )
+        model.sortformer_modules.spkcache_len = 4
+        model.sortformer_modules.fifo_len = 0
+        model.sortformer_modules.chunk_len = 2
+        model.sortformer_modules.spkcache_update_period = 2
+        model.sortformer_modules.chunk_left_context = 0
+        model.sortformer_modules.chunk_right_context = 0
+        model.train(training)
+
+        observed_runtime_values = []
+        build_mask_mod = model.encoder._build_mask_mod
+
+        def record_runtime_values(length):
+            observed_runtime_values.append((model.encoder.causal_tail_len, model.encoder.causal_tail_block_size))
+            return build_mask_mod(length)
+
+        with (
+            patch.object(model.encoder, "_build_mask_mod", side_effect=record_runtime_values),
+            patch("nemo.collections.asr.models.sortformer_diar_models.random.random", return_value=0.0),
+            patch(
+                "nemo.collections.asr.models.sortformer_diar_models.random.randint",
+                side_effect=random_values,
+            ) as randint_mock,
+            torch.no_grad(),
+        ):
+            model.forward_streaming(torch.randn(1, 128, 32), torch.tensor([32]))
+
+        assert observed_runtime_values
+        assert set(observed_runtime_values) == {expected_runtime_values}
+        assert model.encoder.causal_tail_len == 0
+        assert model.encoder.causal_tail_block_size == 1
+        assert [mock_call.args for mock_call in randint_mock.call_args_list] == expected_randint_args
+
+    @pytest.mark.unit
+    def test_causal_tail_runtime_state_is_reset_when_streaming_step_raises(self):
+        model = _create_sortformer_model(
+            frontend_encoder="transformer",
+            streaming_mode=True,
+            max_causal_tail_len=5,
+            min_causal_tail_block_size=2,
+            max_causal_tail_block_size=4,
+        ).train()
+        streaming_chunk = (
+            0,
+            torch.randn(1, 8, 128),
+            torch.tensor([8]),
+            0,
+            0,
+        )
+
+        def fail_streaming_step(**kwargs):
+            assert model.encoder.causal_tail_len == 4
+            assert model.encoder.causal_tail_block_size == 3
+            raise RuntimeError("injected streaming failure")
+
+        with (
+            patch("nemo.collections.asr.models.sortformer_diar_models.random.random", return_value=0.0),
+            patch("nemo.collections.asr.models.sortformer_diar_models.random.randint", side_effect=(4, 3)),
+            patch.object(model.sortformer_modules, "streaming_feat_loader", return_value=[streaming_chunk]),
+            patch.object(model, "forward_streaming_step", side_effect=fail_streaming_step),
+            pytest.raises(RuntimeError, match="injected streaming failure"),
+        ):
+            model.forward_streaming(torch.randn(1, 128, 8), torch.tensor([8]))
+
+        assert model.encoder.causal_tail_len == 0
+        assert model.encoder.causal_tail_block_size == 1
+
+    @pytest.mark.unit
+    def test_causal_tail_accepts_default_full_attention_mode(self):
+        model = _create_sortformer_model(
+            frontend_encoder="transformer",
+            streaming_mode=True,
+            max_causal_tail_len=5,
+            encoder_attn_mode=None,
+        )
+
+        assert model.encoder.attn_mode == "full"
+        assert model.encoder.causal_tail_block_size == 1
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("settings", "exception_type", "error_match"),
+        [
+            ({"max_causal_tail_len": True}, TypeError, "max_causal_tail_len must be a non-negative integer"),
+            ({"max_causal_tail_len": 1.5}, TypeError, "max_causal_tail_len must be a non-negative integer"),
+            ({"max_causal_tail_len": -1}, ValueError, "max_causal_tail_len must be non-negative"),
+            ({"causal_tail_prob": True}, TypeError, "causal_tail_prob must be a real number"),
+            ({"causal_tail_prob": "0.5"}, TypeError, "causal_tail_prob must be a real number"),
+            ({"causal_tail_prob": -0.1}, ValueError, "causal_tail_prob must be in"),
+            ({"causal_tail_prob": 1.1}, ValueError, "causal_tail_prob must be in"),
+            (
+                {"min_causal_tail_block_size": True},
+                TypeError,
+                "min_causal_tail_block_size must be a positive integer",
+            ),
+            (
+                {"max_causal_tail_block_size": 1.5},
+                TypeError,
+                "max_causal_tail_block_size must be a positive integer",
+            ),
+            (
+                {"min_causal_tail_block_size": 0},
+                ValueError,
+                "min_causal_tail_block_size must be at least 1",
+            ),
+            (
+                {"min_causal_tail_block_size": 3, "max_causal_tail_block_size": 2},
+                ValueError,
+                "max_causal_tail_block_size must be greater than or equal",
+            ),
+            (
+                {"max_causal_tail_len": 5, "max_causal_tail_block_size": 6},
+                ValueError,
+                "max_causal_tail_block_size must be less than or equal to max_causal_tail_len",
+            ),
+        ],
+    )
+    def test_invalid_causal_tail_policy_is_rejected(self, settings, exception_type, error_match):
+        with pytest.raises(exception_type, match=error_match):
+            _create_sortformer_model(frontend_encoder="transformer", **settings)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("frontend_encoder", "streaming_mode", "error_match"),
+        [
+            ("transformer", False, "requires streaming_mode=True"),
+            ("conformer", True, "requires an encoder that exposes causal_tail_len"),
+            ("streaming_transformer", True, "requires TransformerEncoder with attn_mode='full'"),
+        ],
+    )
+    def test_incompatible_causal_tail_configuration_is_rejected(self, frontend_encoder, streaming_mode, error_match):
+        with pytest.raises(ValueError, match=error_match):
+            _create_sortformer_model(
+                frontend_encoder=frontend_encoder,
+                streaming_mode=streaming_mode,
+                max_causal_tail_len=4,
+            )
+
+    @pytest.mark.unit
+    def test_disabled_causal_tail_does_not_modify_incompatible_encoder(self):
+        model = _create_sortformer_model(frontend_encoder="conformer", streaming_mode=True).eval()
+
+        assert not hasattr(model.encoder, "causal_tail_len")
+        assert not hasattr(model.encoder, "causal_tail_block_size")
+        with (
+            patch.object(model.sortformer_modules, "streaming_feat_loader", return_value=[]),
+            torch.no_grad(),
+        ):
+            model.forward_streaming(torch.randn(1, 80, 8), torch.tensor([8]))
+
+        assert not hasattr(model.encoder, "causal_tail_len")
+        assert not hasattr(model.encoder, "causal_tail_block_size")
 
     @pytest.mark.unit
     def test_constructor(self, sortformer_model):
