@@ -779,8 +779,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def oom_safe_feature_extraction(self, input_signal, input_signal_length):
         """
-        This function divides the input signal into smaller sub-batches and processes them sequentially
-        to prevent out-of-memory errors during feature extraction.
+        Process duration-bounded waveform sub-batches sequentially to limit feature-extraction memory.
 
         Args:
             input_signal (torch.Tensor): The input audio signal.
@@ -792,36 +791,58 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             (length matches original batch size) and
             ``processed_signal_length`` contains the lengths of the processed signals.
         """
-        input_signal = input_signal.cpu()
-        processed_signal_list, processed_signal_length_list = [], []
-        max_batch_sec = input_signal.shape[1] / self.preprocessor._cfg.sample_rate
         org_batch_size = input_signal.shape[0]
-        div_batch_count = min(int(max_batch_sec * org_batch_size // self.max_batch_dur + 1), org_batch_size)
-        div_size = math.ceil(org_batch_size / div_batch_count)
+        sample_rate = self.preprocessor._cfg.sample_rate
+        input_lengths = input_signal_length.detach().cpu().tolist()
+        max_input_length = max(input_lengths)
+        featurizer = self.preprocessor.featurizer
+        max_feature_length = int(featurizer.get_seq_len(torch.tensor(max_input_length)).item()) + 1
+        if featurizer.pad_to == "max":
+            max_feature_length = int(featurizer.max_length)
+        elif featurizer.pad_to > 0:
+            max_feature_length = math.ceil(max_feature_length / featurizer.pad_to) * featurizer.pad_to
 
-        for div_count in range(div_batch_count):
-            start_idx = int(div_count * div_size)
-            end_idx = int((div_count + 1) * div_size)
-            if start_idx >= org_batch_size:
-                break
-            input_signal_div = input_signal[start_idx:end_idx, :].to(self.device)
+        processed_signal = None
+        processed_signal_length = torch.empty(org_batch_size, dtype=torch.long, device=self.device)
+        start_idx = 0
+        warned_singleton_over_limit = False
+        while start_idx < org_batch_size:
+            end_idx = start_idx + 1
+            local_max_length = input_lengths[start_idx]
+            if local_max_length / sample_rate > self.max_batch_dur and not warned_singleton_over_limit:
+                logging.warning(
+                    f"Encountered a recording of duration {local_max_length / sample_rate:.2f}s, which exceeds "
+                    f"max_batch_dur={self.max_batch_dur}s. Processing it alone; batch-axis splitting cannot "
+                    "reduce its feature-extraction memory."
+                )
+                warned_singleton_over_limit = True
+
+            while end_idx < org_batch_size:
+                candidate_max_length = max(local_max_length, input_lengths[end_idx])
+                candidate_batch_size = end_idx - start_idx + 1
+                if candidate_batch_size * candidate_max_length / sample_rate > self.max_batch_dur:
+                    break
+                local_max_length = candidate_max_length
+                end_idx += 1
+
+            input_signal_div = input_signal[start_idx:end_idx, :local_max_length]
             input_signal_length_div = input_signal_length[start_idx:end_idx]
             processed_signal_div, processed_signal_length_div = self.preprocessor(
                 input_signal=input_signal_div, length=input_signal_length_div
             )
-            processed_signal_div = processed_signal_div.detach().cpu()
-            processed_signal_length_div = processed_signal_length_div.detach().cpu()
-            processed_signal_list.append(processed_signal_div)
-            processed_signal_length_list.append(processed_signal_length_div)
+            if processed_signal is None:
+                output_dtype = processed_signal_div.dtype if self.training else self.dtype
+                processed_signal = torch.full(
+                    (org_batch_size, processed_signal_div.shape[1], max_feature_length),
+                    featurizer.pad_value,
+                    dtype=output_dtype,
+                    device=self.device,
+                )
+            processed_signal[start_idx:end_idx, :, : processed_signal_div.shape[-1]].copy_(processed_signal_div)
+            processed_signal_length[start_idx:end_idx].copy_(processed_signal_length_div)
+            start_idx = end_idx
+            del input_signal_div, input_signal_length_div, processed_signal_div, processed_signal_length_div
 
-        processed_signal = torch.cat(processed_signal_list, 0)
-        processed_signal_length = torch.cat(processed_signal_length_list, 0)
-        assert processed_signal.shape[0] == org_batch_size, (
-            f"The resulting batch size of processed signal - {processed_signal.shape[0]} "
-            f"is not equal to original batch size: {org_batch_size}"
-        )
-        processed_signal = processed_signal.to(self.device)
-        processed_signal_length = processed_signal_length.to(self.device)
         return processed_signal, processed_signal_length
 
     def process_signal(self, audio_signal, audio_signal_length):
@@ -831,7 +852,7 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
         This function performs the following steps:
         1. Moves the audio signal to the correct device.
         2. Normalizes the time-series audio signal.
-        3. Extrac audio feature from from the time-series audio signal using the model's preprocessor.
+        3. Extract audio features from the time-series audio signal using the model's preprocessor.
 
         Args:
             audio_signal (torch.Tensor): The input audio signal.
@@ -845,11 +866,12 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             processed_signal_length (torch.Tensor): The length of each processed signal.
                 Shape: (batch_size,)
         """
-        audio_signal, audio_signal_length = audio_signal.to(self.device), audio_signal_length.to(self.device)
+        batch_total_dur = audio_signal.shape[0] * audio_signal.shape[1] / self.preprocessor._cfg.sample_rate
+        audio_signal = audio_signal.to(self.device)
+        audio_signal_length = audio_signal_length.to(self.device)
         if not self.streaming_mode:
             audio_signal = (1 / (audio_signal.max() + self.eps)) * audio_signal
 
-        batch_total_dur = audio_signal.shape[0] * audio_signal.shape[1] / self.preprocessor._cfg.sample_rate
         if self.max_batch_dur > 0 and self.max_batch_dur < batch_total_dur:
             processed_signal, processed_signal_length = self.oom_safe_feature_extraction(
                 input_signal=audio_signal, input_signal_length=audio_signal_length
@@ -858,11 +880,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             processed_signal, processed_signal_length = self.preprocessor(
                 input_signal=audio_signal, length=audio_signal_length
             )
-        # This cache clearning can significantly slow down the training speed.
-        # Only perform `empty_cache()` when the input file is extremely large for streaming mode.
-        if not self.training and self.streaming_mode:
-            del audio_signal, audio_signal_length
-            torch.cuda.empty_cache()
         return processed_signal, processed_signal_length
 
     def forward(
@@ -2134,7 +2151,6 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
                     self.preds_total_list.append(preds)
                 else:
                     self.preds_total_list.extend(torch.split(preds, [1] * preds.shape[0]))
-                torch.cuda.empty_cache()
 
         logging.info(f"Batch F1Acc. MEAN: {torch.mean(torch.tensor(self.batch_f1_accs_list))}")
         logging.info(f"Batch Precision MEAN: {torch.mean(torch.tensor(self.batch_precision_list))}")

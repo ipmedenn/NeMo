@@ -102,7 +102,7 @@ class DiarizationConfig:
     # Total padded-audio duration threshold, in seconds, for feature extraction.
     # Above it, batches are split along the batch dimension; <= 0 disables splitting.
     # Lower this value for feature-extraction OOMs.
-    max_batch_dur: float = 100000
+    max_batch_dur: float = 36000
 
     # Eval Settings: (0.25, False) should be default setting for sortformer eval.
     collar: float = 0.25  # Collar in seconds for DER calculation

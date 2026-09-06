@@ -401,6 +401,89 @@ class TestSortformerEncLabelModelOffline:
         diff = torch.max(torch.abs(preds_instance - preds_batch))
         assert diff <= 1e-6
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "audio_lengths, max_batch_dur",
+        [
+            ((4000, 3200, 1600), 0.45),
+            ((3200, 2800, 2400, 1600), 0.30),
+        ],
+        ids=["two-sub-batches", "three-sub-batches"],
+    )
+    def test_oom_safe_feature_extraction_matches_unsplit_output(self, audio_lengths, max_batch_dur):
+        model = _create_sortformer_model().eval()
+        audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
+        audio = torch.zeros(audio_lengths.shape[0], int(audio_lengths.max().item()))
+        for sample_idx, sample_length in enumerate(audio_lengths.tolist()):
+            sample_times = torch.arange(sample_length, dtype=torch.float32)
+            audio[sample_idx, :sample_length] = torch.sin(sample_times * (sample_idx + 1) * 0.013)
+
+        with torch.no_grad():
+            model.max_batch_dur = 0
+            expected_features, expected_lengths = model.process_signal(audio, audio_lengths)
+            model.max_batch_dur = max_batch_dur
+            actual_features, actual_lengths = model.process_signal(audio, audio_lengths)
+
+        torch.testing.assert_close(actual_lengths, expected_lengths)
+        assert actual_features.shape == expected_features.shape
+        for sample_idx, feature_length in enumerate(actual_lengths.tolist()):
+            torch.testing.assert_close(
+                actual_features[sample_idx, :, :feature_length],
+                expected_features[sample_idx, :, :feature_length],
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            padding = actual_features[sample_idx, :, feature_length:]
+            assert torch.all(padding == model.preprocessor.featurizer.pad_value)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "audio_width, audio_lengths, max_batch_dur, expected_input_shapes",
+        [
+            (6000, (4000, 3000, 2000, 1000), 0.45, ((1, 4000), (2, 3000), (1, 1000))),
+            (24000, (20000, 4000, 3000), 0.50, ((1, 20000), (2, 4000))),
+        ],
+        ids=["duration-bounded", "singleton-over-limit"],
+    )
+    def test_oom_safe_feature_extraction_crops_and_bounds_sub_batches(
+        self, audio_width, audio_lengths, max_batch_dur, expected_input_shapes
+    ):
+        model = _create_sortformer_model().eval()
+        model.max_batch_dur = max_batch_dur
+        audio = torch.randn(len(audio_lengths), audio_width)
+        audio_lengths = torch.tensor(audio_lengths, dtype=torch.long)
+
+        with patch.object(model.preprocessor, "forward", wraps=model.preprocessor.forward) as preprocessor_forward:
+            with torch.no_grad():
+                model.process_signal(audio, audio_lengths)
+
+        calls = preprocessor_forward.call_args_list
+        input_shapes = tuple(tuple(call.kwargs["input_signal"].shape) for call in calls)
+        assert len(calls) > 1
+        assert input_shapes == expected_input_shapes
+        assert all(input_shape[-1] < audio_width for input_shape in input_shapes)
+        for call in calls:
+            input_signal = call.kwargs["input_signal"]
+            input_lengths = call.kwargs["length"]
+            assert input_signal.shape[-1] == input_lengths.max().item()
+            padded_duration = input_signal.shape[0] * input_signal.shape[-1] / model.preprocessor._cfg.sample_rate
+            assert padded_duration <= max_batch_dur or input_signal.shape[0] == 1
+
+    @pytest.mark.unit
+    def test_oom_safe_feature_extraction_uses_bfloat16_storage_during_bfloat16_inference(self):
+        model = _create_sortformer_model().to(dtype=torch.bfloat16).eval()
+        model.max_batch_dur = 0.30
+        audio_lengths = torch.tensor([3200, 2400, 1600], dtype=torch.long)
+        audio = torch.randn(audio_lengths.shape[0], int(audio_lengths.max().item()))
+
+        with torch.no_grad():
+            processed_features, processed_lengths = model.process_signal(audio, audio_lengths)
+
+        expected_lengths = model.preprocessor.featurizer.get_seq_len(audio_lengths)
+        assert processed_features.dtype == torch.bfloat16
+        assert processed_lengths.dtype == torch.long
+        torch.testing.assert_close(processed_lengths.cpu(), expected_lengths)
+
 
 class TestSortformerEncLabelModelLossRepresentation:
     @pytest.mark.unit
