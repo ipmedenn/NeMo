@@ -23,14 +23,22 @@ import numpy as np
 import onnx
 import pytest
 import torch
-from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import DiarizationConfig, get_tensor_path
+from examples.speaker_tasks.diarization.neural_diarizer.e2e_diarize_speech import (
+    DiarizationConfig,
+    get_tensor_path,
+    load_diarization_model,
+)
 from omegaconf import DictConfig
 from onnx.reference import ReferenceEvaluator
 
 from nemo.collections.asr.models import SortformerEncLabelModel
 from nemo.collections.asr.models.sortformer_diar_models import _OversamplingDistributedSampler
 from nemo.collections.asr.parts.submodules.subsampling import FeatureStacking
-from nemo.collections.asr.parts.utils.sortformer_utils import InferenceProfiler, configure_output_subsampling_factor
+from nemo.collections.asr.parts.utils.sortformer_utils import (
+    InferenceProfiler,
+    configure_output_subsampling_factor,
+    get_prediction_cache_metadata,
+)
 
 
 class RecordingSpecAugment(torch.nn.Module):
@@ -1566,6 +1574,60 @@ class TestSortformerEncLabelModelHighResolution:
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
+        "model_path, pretrained_name, loader_name, expected_kwargs",
+        [
+            (
+                "/models/diarizer.ckpt",
+                None,
+                "load_from_checkpoint",
+                {"checkpoint_path": "/models/diarizer.ckpt", "strict": False},
+            ),
+            (
+                "/models/diarizer.nemo",
+                None,
+                "restore_from",
+                {"restore_path": "/models/diarizer.nemo"},
+            ),
+            (
+                None,
+                "nvidia/diar_sortformer_4spk-v1",
+                "from_pretrained",
+                {"model_name": "nvidia/diar_sortformer_4spk-v1"},
+            ),
+        ],
+        ids=["checkpoint", "nemo", "hugging-face"],
+    )
+    def test_load_diarization_model_selects_configured_source(
+        self, model_path, pretrained_name, loader_name, expected_kwargs
+    ):
+        map_location = torch.device("cpu")
+        expected_model = object()
+        with patch.object(SortformerEncLabelModel, loader_name, return_value=expected_model) as loader:
+            actual_model = load_diarization_model(
+                model_path=model_path,
+                pretrained_name=pretrained_name,
+                map_location=map_location,
+            )
+
+        assert actual_model is expected_model
+        loader.assert_called_once_with(**expected_kwargs, map_location=map_location)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "model_path, pretrained_name",
+        [(None, None), ("/models/diarizer.nemo", "nvidia/diar_sortformer_4spk-v1")],
+        ids=["missing", "ambiguous"],
+    )
+    def test_load_diarization_model_requires_exactly_one_source(self, model_path, pretrained_name):
+        with pytest.raises(ValueError, match="Specify exactly one"):
+            load_diarization_model(
+                model_path=model_path,
+                pretrained_name=pretrained_name,
+                map_location=torch.device("cpu"),
+            )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
         (
             "model_filename, manifest_filename, cache_filename, output_subsampling_factor, expected_model_id, "
             "expected_tensor_filename"
@@ -1596,6 +1658,50 @@ class TestSortformerEncLabelModelHighResolution:
         assert model_id == expected_model_id
         assert tensor_filename == expected_tensor_filename
         assert not (tmp_path / "pred_tensors").exists()
+
+    @pytest.mark.unit
+    def test_pretrained_model_prediction_cache_identity(self, tmp_path):
+        manifest_path = tmp_path / "sample.json"
+        manifest_path.write_text("{}\n")
+        cfg = SimpleNamespace(
+            model_path=None,
+            pretrained_name="nvidia/diar_sortformer_4spk-v1",
+            dataset_manifest=str(manifest_path),
+            output_subsampling_factor=8,
+            precision="32",
+            presort_manifest=True,
+            async_streaming=False,
+            async_pad_to_max=False,
+            async_desync_updates=False,
+            chunk_len=6,
+            chunk_left_context=0,
+            chunk_right_context=7,
+            spkcache_len=0,
+            spkcache_update_period=144,
+            fifo_len=188,
+        )
+        model = _create_sortformer_model()
+
+        metadata = get_prediction_cache_metadata(cfg, model, {"sample": {}})
+
+        assert metadata["model_path"] == cfg.pretrained_name
+        assert metadata["model_size"] is None
+        assert metadata["model_mtime_ns"] is None
+
+    @pytest.mark.unit
+    def test_pretrained_model_prediction_tensor_path_uses_repository_name(self, tmp_path):
+        cfg = SimpleNamespace(
+            model_path=None,
+            pretrained_name="nvidia/diar_sortformer_4spk-v1",
+            dataset_manifest=str(tmp_path / "sample.json"),
+            output_subsampling_factor=8,
+            out_preds_tensors=str(tmp_path / "predictions.pt"),
+        )
+
+        _, model_id, tensor_filename = get_tensor_path(cfg)
+
+        assert model_id == "diar_sortformer_4spk-v1_sf8"
+        assert tensor_filename == "sample"
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
